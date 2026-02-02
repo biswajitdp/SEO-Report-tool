@@ -40,7 +40,7 @@ try:
 except Exception:
     GOOGLE_OK = False
 
-GOOGLE_CRED_FILE = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+GOOGLE_CRED_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GSC_SITE_URL = os.getenv("GSC_SITE_URL", "").strip()
 GA4_PROPERTY_ID = os.getenv("GA4_PROPERTY_ID", "").strip()
 
