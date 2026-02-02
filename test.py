@@ -4,7 +4,9 @@ import io
 import csv
 import ssl
 import time
+import json
 import sqlite3
+import tempfile
 import requests
 from datetime import datetime, date, timedelta
 from urllib.parse import urlparse
@@ -16,21 +18,41 @@ from email.message import EmailMessage
 import smtplib
 
 # ------------------- ENV -------------------
+# Local dev: loads .env (Streamlit Cloud: secrets are used instead)
 load_dotenv()
 
-SERPAPI_KEY = os.getenv("SERPAPI_KEY", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+def _get_setting(key: str, default: str = "") -> str:
+    """
+    Read from st.secrets first (Streamlit Cloud), fallback to env (local).
+    """
+    try:
+        if key in st.secrets:
+            return str(st.secrets.get(key, default)).strip()
+    except Exception:
+        pass
+    return os.getenv(key, default).strip()
+
+SERPAPI_KEY = _get_setting("SERPAPI_KEY")
+OPENAI_API_KEY = _get_setting("OPENAI_API_KEY")
 
 # SMTP
-SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587").strip() or "587")
-SMTP_USER = os.getenv("SMTP_USER", "").strip()
-SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
-MAIL_FROM = os.getenv("MAIL_FROM", "").strip()
-REPORT_TO = [x.strip() for x in os.getenv("REPORT_TO", "").split(",") if x.strip()]
-REPORT_CC = [x.strip() for x in os.getenv("REPORT_CC", "").split(",") if x.strip()]
+SMTP_HOST = _get_setting("SMTP_HOST")
+SMTP_PORT = int(_get_setting("SMTP_PORT", "587") or "587")
+SMTP_USER = _get_setting("SMTP_USER")
+SMTP_PASS = _get_setting("SMTP_PASS")
+MAIL_FROM = _get_setting("MAIL_FROM")
+REPORT_TO = [x.strip() for x in _get_setting("REPORT_TO").split(",") if x.strip()]
+REPORT_CC = [x.strip() for x in _get_setting("REPORT_CC").split(",") if x.strip()]
 
-# Google
+# Google (config)
+GSC_SITE_URL = _get_setting("GSC_SITE_URL")
+GA4_PROPERTY_ID = _get_setting("GA4_PROPERTY_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = _get_setting("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+# DB
+DB = _get_setting("SQLITE_DB", "rank_history.db") or "rank_history.db"
+
+# ------------------- GOOGLE IMPORTS -------------------
 GOOGLE_OK = True
 try:
     from google.oauth2 import service_account
@@ -40,13 +62,108 @@ try:
 except Exception:
     GOOGLE_OK = False
 
-GOOGLE_CRED_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-GSC_SITE_URL = os.getenv("GSC_SITE_URL", "").strip()
-GA4_PROPERTY_ID = os.getenv("GA4_PROPERTY_ID", "").strip()
+# ------------------- HELPERS -------------------
+def normalize_domain(domain: str) -> str:
+    d = (domain or "").strip().lower()
+    d = d.replace("https://", "").replace("http://", "").strip("/")
+    d = d.replace("www.", "")
+    return d
 
-# ------------------- DB --------------------
-DB = os.getenv("SQLITE_DB", "rank_history.db").strip() or "rank_history.db"
+def domain_match(target_domain: str, url: str) -> bool:
+    td = normalize_domain(target_domain)
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    parsed = urlparse(raw)
+    netloc = (parsed.netloc or "").lower().replace("www.", "")
+    if not netloc:
+        netloc = normalize_domain(raw).split("/")[0]
+    return netloc == td or netloc.endswith("." + td)
 
+def html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def safe_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+def fmt_pos(p: float) -> str:
+    return f"{p:.0f}" if p and p > 0 else "NR"
+
+def google_domain_from_gl(gl: str) -> str:
+    gl = (gl or "").lower().strip()
+    special = {
+        "us": "google.com",
+        "ae": "google.ae",
+        "in": "google.co.in",
+        "uk": "google.co.uk",
+        "gb": "google.co.uk",
+        "ca": "google.ca",
+        "au": "google.com.au",
+        "sa": "google.com.sa",
+        "qa": "google.com.qa",
+        "kw": "google.com.kw",
+        "om": "google.com.om",
+        "bh": "google.com.bh",
+    }
+    return special.get(gl, "google.com")
+
+def today_local() -> date:
+    return datetime.now().date()
+
+def last_full_week_range() -> tuple[date, date]:
+    """
+    Last completed Mon-Sun week.
+    """
+    t = today_local()
+    # Find last Sunday
+    days_since_sun = (t.weekday() - 6) % 7
+    last_sun = t - timedelta(days=days_since_sun or 7)
+    last_mon = last_sun - timedelta(days=6)
+    return last_mon, last_sun
+
+def daterange(ws: date, we: date):
+    d = ws
+    out = []
+    while d <= we:
+        out.append(d)
+        d += timedelta(days=1)
+    return out
+
+# ------------------- STREAMLIT CLOUD GOOGLE CREDS -------------------
+def ensure_google_application_credentials() -> str | None:
+    """
+    Streamlit Cloud doesn't have credential files.
+    We store service account JSON in secrets/env and write to temp file.
+    """
+    # If a valid file path already exists (local machine case)
+    existing = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if existing and os.path.exists(existing):
+        return existing
+
+    raw = (GOOGLE_SERVICE_ACCOUNT_JSON or "").strip()
+    if not raw:
+        return None
+
+    # Validate it's JSON
+    try:
+        json.loads(raw)
+    except Exception:
+        # Sometimes users paste with trailing spaces; still invalid => return None
+        return None
+
+    tmp_path = os.path.join(tempfile.gettempdir(), "service-account.json")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(raw)
+
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_path
+    return tmp_path
+
+GOOGLE_CRED_FILE = ensure_google_application_credentials()
+
+# ------------------- DB SCHEMA + MIGRATION -------------------
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS daily_ranks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,10 +185,82 @@ CREATE INDEX IF NOT EXISTS idx_daily_ranks_date ON daily_ranks(checked_date);
 CREATE INDEX IF NOT EXISTS idx_daily_ranks_domain ON daily_ranks(project_domain);
 """
 
+def _table_columns(con, table: str) -> set[str]:
+    cols = set()
+    for r in con.execute(f"PRAGMA table_info({table})").fetchall():
+        cols.add(r[1])
+    return cols
+
+def migrate_db_if_needed(con: sqlite3.Connection):
+    """
+    Fix old DB that doesn't have 'project_domain' (or other missing columns).
+    We'll rebuild table safely if required.
+    """
+    con.execute("CREATE TABLE IF NOT EXISTS __migrations (name TEXT PRIMARY KEY, applied_at TEXT)")
+    # If no table yet, schema script handles it
+    con.executescript(SCHEMA_SQL)
+
+    cols = _table_columns(con, "daily_ranks")
+    required = {
+        "checked_date", "project_domain", "keyword", "location", "gl", "hl",
+        "device", "position", "url", "source", "created_at"
+    }
+
+    if required.issubset(cols):
+        return  # OK
+
+    # Rebuild table
+    con.execute("ALTER TABLE daily_ranks RENAME TO daily_ranks_old")
+
+    con.executescript(SCHEMA_SQL)
+
+    old_cols = _table_columns(con, "daily_ranks_old")
+    # Map best-effort columns from old to new
+    # If old DB didn't have project_domain, we set it to '' (it will still store new rows correctly).
+    select_cols = []
+    insert_cols = [
+        "checked_date", "project_domain", "keyword", "location", "gl", "hl",
+        "device", "position", "url", "source", "created_at"
+    ]
+
+    def pick(name, fallback_literal=None):
+        if name in old_cols:
+            return name
+        if fallback_literal is not None:
+            return fallback_literal
+        return "''"
+
+    select_cols = [
+        pick("checked_date"),
+        pick("project_domain", "''"),
+        pick("keyword"),
+        pick("location", "''"),
+        pick("gl", "''"),
+        pick("hl", "''"),
+        pick("device", "'desktop'"),
+        pick("position", "0"),
+        pick("url", "''"),
+        pick("source", "''"),
+        pick("created_at", "''"),
+    ]
+
+    con.execute(
+        f"""
+        INSERT OR IGNORE INTO daily_ranks ({",".join(insert_cols)})
+        SELECT {",".join(select_cols)} FROM daily_ranks_old
+        """
+    )
+    con.execute("DROP TABLE daily_ranks_old")
+    con.execute(
+        "INSERT OR REPLACE INTO __migrations (name, applied_at) VALUES (?, ?)",
+        ("rebuild_daily_ranks_v1", datetime.utcnow().isoformat()),
+    )
+    con.commit()
+
 def db_connect():
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
-    con.executescript(SCHEMA_SQL)
+    migrate_db_if_needed(con)
     return con
 
 def upsert_daily_rank(con, checked_date, project_domain, keyword, location, gl, hl, device, position, url, source):
@@ -130,72 +319,6 @@ def get_min_max_dates(con, project_domain):
         return None, None
     return date.fromisoformat(row["mn"]), date.fromisoformat(row["mx"])
 
-# ------------------- HELPERS -------------------
-def normalize_domain(domain: str) -> str:
-    d = (domain or "").strip().lower()
-    d = d.replace("https://", "").replace("http://", "").strip("/")
-    d = d.replace("www.", "")
-    return d
-
-def domain_match(target_domain: str, url: str) -> bool:
-    td = normalize_domain(target_domain)
-    raw = (url or "").strip()
-    if not raw:
-        return False
-    parsed = urlparse(raw)
-    netloc = (parsed.netloc or "").lower().replace("www.", "")
-    if not netloc:
-        netloc = normalize_domain(raw).split("/")[0]
-    return netloc == td or netloc.endswith("." + td)
-
-def html_escape(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-def safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
-
-def fmt_pos(p: float) -> str:
-    return f"{p:.0f}" if p and p > 0 else "NR"
-
-def google_domain_from_gl(gl: str) -> str:
-    gl = (gl or "").lower().strip()
-    special = {
-        "us": "google.com",
-        "ae": "google.ae",
-        "in": "google.co.in",
-        "uk": "google.co.uk",
-        "gb": "google.co.uk",
-        "ca": "google.ca",
-        "au": "google.com.au",
-        "sa": "google.com.sa",
-        "qa": "google.com.qa",
-        "kw": "google.com.kw",
-        "om": "google.com.om",
-        "bh": "google.com.bh",
-    }
-    return special.get(gl, "google.com")
-
-def today_local() -> date:
-    return datetime.now().date()
-
-def last_full_week_range() -> tuple[date, date]:
-    t = today_local()
-    days_since_sun = (t.weekday() - 6) % 7
-    last_sun = t - timedelta(days=days_since_sun or 7)
-    last_mon = last_sun - timedelta(days=6)
-    return last_mon, last_sun
-
-def daterange(ws: date, we: date):
-    d = ws
-    out = []
-    while d <= we:
-        out.append(d)
-        d += timedelta(days=1)
-    return out
-
 # ------------------- LOCATION RESOLVE (SerpAPI) -------------------
 def resolve_location_serpapi(api_key: str, query: str) -> dict:
     query = (query or "").strip()
@@ -244,14 +367,13 @@ def serpapi_get_rank(
     if location:
         params["location"] = location
 
-    # paginate 0..90
+    # paginate 0..90 (top 100)
     for start in range(0, min(top_n, 100), 10):
         params["start"] = start
         r = requests.get("https://serpapi.com/search.json", params=params, timeout=60)
         r.raise_for_status()
         data = r.json()
 
-        # Organic only (stable)
         organic = data.get("organic_results", []) or []
         for item in organic:
             pos = item.get("position")
@@ -355,15 +477,16 @@ def ga4_organic_sessions(sa_file: str, property_id: str, start_date: str, end_da
 
 # ------------------- MATRIX / WEEK CALCS -------------------
 def build_matrix(rows: list[dict], days: list[date]) -> dict:
-    """
-    key=(keyword, location, device) -> map day->pos/url/source
-    """
     m = {}
     for r in rows:
         k = (r["keyword"], r.get("location", ""), r.get("device", "desktop"))
         if k not in m:
             m[k] = {}
-        m[k][r["checked_date"]] = {"pos": safe_float(r.get("position")), "url": r.get("url","") or "", "source": r.get("source","") or ""}
+        m[k][r["checked_date"]] = {
+            "pos": safe_float(r.get("position")),
+            "url": r.get("url", "") or "",
+            "source": r.get("source", "") or ""
+        }
 
     for k in list(m.keys()):
         for d in days:
@@ -420,7 +543,7 @@ def movers_vs_prev(curr_matrix: dict, prev_matrix: dict, limit=20):
 # ------------------- EMAIL -------------------
 def send_email(subject: str, html_body: str, csv_bytes: bytes, csv_filename: str):
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and REPORT_TO):
-        raise RuntimeError("SMTP settings missing in .env")
+        raise RuntimeError("SMTP settings missing (check Streamlit Secrets or .env).")
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -449,13 +572,8 @@ def clean_llm_html(s: str) -> str:
     return s.strip()
 
 def generate_llm_insights_strict(payload_text: str) -> str:
-    """
-    Generates insights ONLY from provided numbers.
-    If OpenAI key missing, returns empty string.
-    """
     if not OPENAI_API_KEY:
         return ""
-
     try:
         from openai import OpenAI
     except Exception:
@@ -463,19 +581,15 @@ def generate_llm_insights_strict(payload_text: str) -> str:
 
     prompt = f"""
 You are an SEO analyst. You MUST ONLY use the numbers and facts from the data provided.
-DO NOT invent metrics, DO NOT assume improvements if not shown.
+DO NOT invent metrics. DO NOT assume improvements if not shown.
 Write a weekly SEO summary in HTML, suitable for a business owner.
 
 Output structure:
 <h3>AI Insights</h3>
 <p>Key highlights...</p>
-<ul>
-<li>...</li>
-</ul>
+<ul><li>...</li></ul>
 <h3>Next Week Action Plan</h3>
-<ul>
-<li>...</li>
-</ul>
+<ul><li>...</li></ul>
 
 DATA:
 {payload_text}
@@ -594,7 +708,6 @@ def build_weekly_email_html(
         </table>
         """
 
-    # Day-wise rank table
     day_headers = "".join([
         f"<th style='border:1px solid #ddd;background:#f4f4f4;'>{d.strftime('%a')}<br>{d.strftime('%d-%b')}</th>"
         for d in curr_days
@@ -675,8 +788,8 @@ def build_weekly_email_html(
         </tr>
         {kpi_row("Clicks", gsc_prev.get("clicks",0), gsc_curr.get("clicks",0))}
         {kpi_row("Impressions", gsc_prev.get("impressions",0), gsc_curr.get("impressions",0))}
-        {kpi_row("CTR", f"{gsc_prev.get('ctr',0.0)*100:.2f}%", f"{gsc_curr.get('ctr',0.0)*100:.2f}%")}
-        {kpi_row("Avg Position", f"{gsc_prev.get('position',0.0):.2f}", f"{gsc_curr.get('position',0.0):.2f}")}
+        {kpi_row("CTR", f"{gsc_prev.get('ctr',0.0)*100:.2f}%", f"{gsc_curr.get('ctr',0.0)*100:.2f}%"))}
+        {kpi_row("Avg Position", f"{gsc_prev.get('position',0.0):.2f}", f"{gsc_curr.get('position',0.0):.2f}"))}
       </table>
 
       {top_table("Top Queries (Current Week)", gsc_top_queries, "query")}
@@ -693,7 +806,7 @@ def build_weekly_email_html(
         {kpi_row("Sessions", ga_prev.get("sessions",0), ga_curr.get("sessions",0))}
         {kpi_row("Organic Sessions", ga_prev_org, ga_curr_org)}
         {kpi_row("Engaged Sessions", ga_prev.get("engaged_sessions",0), ga_curr.get("engaged_sessions",0))}
-        {kpi_row("Engagement Rate", f"{ga_prev.get('engagement_rate',0.0)*100:.2f}%", f"{ga_curr.get('engagement_rate',0.0)*100:.2f}%")}
+        {kpi_row("Engagement Rate", f"{ga_prev.get('engagement_rate',0.0)*100:.2f}%", f"{ga_curr.get('engagement_rate',0.0)*100:.2f}%"))}
         {kpi_row("Conversions", ga_prev.get("conversions",0.0), ga_curr.get("conversions",0.0))}
       </table>
 
@@ -733,7 +846,6 @@ def build_weekly_csv(ws: date, we: date, prev_ws: date, prev_we: date, curr_days
     writer.writerow(headers)
 
     keys = sorted(set(curr_matrix.keys()) | set(prev_matrix.keys()), key=lambda x: (x[0].lower(), x[1].lower(), x[2].lower()))
-
     for k in keys:
         kw, loc, dev = k
         curr_dm = curr_matrix.get(k, {})
@@ -764,7 +876,6 @@ def build_weekly_csv(ws: date, we: date, prev_ws: date, prev_we: date, curr_days
             trend,
             delta,
         ]
-
         for d in curr_days:
             p = safe_float(curr_dm.get(d.isoformat(), {}).get("pos", 0.0)) if curr_dm else 0.0
             row.append(int(p) if p > 0 else "NR")
@@ -777,10 +888,10 @@ def build_weekly_csv(ws: date, we: date, prev_ws: date, prev_we: date, curr_days
 st.set_page_config(page_title="SEO Rank + Weekly Report", page_icon="📈", layout="wide")
 
 st.title("📈 SEO Rank Tracker + Weekly SEO Report (GSC + GA4 + AI)")
-st.caption("Daily store → Compare → Weekly Mail with complete SEO report (no optional sections)")
+st.caption("Daily store → Compare → Weekly Mail with complete SEO report")
 
 if not SERPAPI_KEY:
-    st.error("SERPAPI_KEY missing in .env")
+    st.error("SERPAPI_KEY missing (set it in Streamlit Secrets or .env).")
     st.stop()
 
 # Sidebar Settings
@@ -800,18 +911,22 @@ auto_resolve = st.sidebar.checkbox("Auto-resolve location (recommended)", value=
 gl_manual = st.sidebar.text_input("Country code (gl) [auto]", value="").strip().lower()
 
 st.sidebar.markdown("---")
-st.sidebar.header("📩 Weekly Mail Requirements (Mandatory)")
+st.sidebar.header("📩 Weekly Report Requirements (Mandatory)")
 
+missing_weekly = []
 if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and REPORT_TO):
-    st.sidebar.error("SMTP not configured in .env. Weekly mail needs SMTP details.")
+    missing_weekly.append("SMTP settings")
 if not GOOGLE_OK:
-    st.sidebar.error("Google libs missing. Install google-api-python-client google-auth google-analytics-data")
-if not (GOOGLE_CRED_FILE and os.path.exists(GOOGLE_CRED_FILE)):
-    st.sidebar.error("GOOGLE_APPLICATION_CREDENTIALS missing or file not found.")
+    missing_weekly.append("Google libraries")
+if not GOOGLE_CRED_FILE:
+    missing_weekly.append("Google service account JSON (GOOGLE_SERVICE_ACCOUNT_JSON)")
 if not GSC_SITE_URL:
-    st.sidebar.error("GSC_SITE_URL missing in .env")
+    missing_weekly.append("GSC_SITE_URL")
 if not GA4_PROPERTY_ID:
-    st.sidebar.error("GA4_PROPERTY_ID missing in .env")
+    missing_weekly.append("GA4_PROPERTY_ID")
+
+if missing_weekly:
+    st.sidebar.error("Weekly report missing:\n- " + "\n- ".join(missing_weekly))
 
 st.sidebar.info(
     "GSC_SITE_URL must match property exactly:\n"
@@ -821,7 +936,11 @@ st.sidebar.info(
 
 # Keywords input
 st.subheader("📝 Keywords")
-keywords_text = st.text_area("Enter keywords (one per line)", height=180, placeholder="emergency plumber dubai\n24 hour plumber near me\naC repair dubai")
+keywords_text = st.text_area(
+    "Enter keywords (one per line)",
+    height=180,
+    placeholder="emergency plumber dubai\n24 hour plumber near me\nac repair dubai",
+)
 keywords = [k.strip() for k in keywords_text.splitlines() if k.strip()]
 
 colA, colB, colC = st.columns([1, 1, 2])
@@ -839,11 +958,9 @@ if auto_resolve and location_text.strip():
         resolved_location = info["location"]
         if not resolved_gl:
             resolved_gl = info.get("gl", "") or ""
-    else:
-        resolved_location = location_text.strip()
 
 if not resolved_gl:
-    resolved_gl = "us"  # safe default
+    resolved_gl = "us"
 
 st.info(f"Using location: **{resolved_location or '(none)'}** | gl: **{resolved_gl}** | hl: **{hl}** | device: **{device}**")
 
@@ -899,7 +1016,7 @@ if run_daily_btn:
                     "location": resolved_location,
                 })
                 progress.progress((i + 1) / len(keywords))
-                time.sleep(0.6)
+                time.sleep(0.4)
 
             st.success("✅ Stored daily ranks successfully!")
             st.dataframe(pd.DataFrame(rows_out), use_container_width=True)
@@ -932,10 +1049,7 @@ if compare_btn:
                 r2 = m2.get(k, {})
                 p1 = safe_float(r1.get("position", 0))
                 p2 = safe_float(r2.get("position", 0))
-                if p1 > 0 and p2 > 0:
-                    delta = int(p1 - p2)
-                else:
-                    delta = ""
+                delta = int(p1 - p2) if (p1 > 0 and p2 > 0) else ""
 
                 out.append({
                     "keyword": k[0],
@@ -956,21 +1070,20 @@ st.subheader("📩 Weekly SEO Report")
 send_weekly_btn = st.button("📨 Send Weekly Email Now (Complete Report)")
 
 if send_weekly_btn:
-    # Validate required configs
     missing = []
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and REPORT_TO):
-        missing.append("SMTP settings (SMTP_HOST/SMTP_USER/SMTP_PASS/MAIL_FROM/REPORT_TO)")
+        missing.append("SMTP settings")
     if not GOOGLE_OK:
         missing.append("Google libraries")
-    if not (GOOGLE_CRED_FILE and os.path.exists(GOOGLE_CRED_FILE)):
-        missing.append("GOOGLE_APPLICATION_CREDENTIALS file")
+    if not GOOGLE_CRED_FILE:
+        missing.append("GOOGLE_SERVICE_ACCOUNT_JSON (Streamlit Secrets)")
     if not GSC_SITE_URL:
         missing.append("GSC_SITE_URL")
     if not GA4_PROPERTY_ID:
         missing.append("GA4_PROPERTY_ID")
 
     if missing:
-        st.error("Weekly report requires these to be configured:\n- " + "\n- ".join(missing))
+        st.error("Weekly report requires:\n- " + "\n- ".join(missing))
         st.stop()
 
     con = db_connect()
@@ -1002,7 +1115,6 @@ if send_weekly_btn:
         ga_prev_org = ga4_organic_sessions(GOOGLE_CRED_FILE, GA4_PROPERTY_ID, prev_ws.isoformat(), prev_we.isoformat())
 
         # ---- LLM insights (strict) ----
-        # build a safe payload text from actual numbers only
         curr_sum = summarize_week(curr_matrix, expected_keywords)
         prev_sum = summarize_week(prev_matrix, expected_keywords)
         ups, downs = movers_vs_prev(curr_matrix, prev_matrix, limit=10)
@@ -1042,7 +1154,6 @@ TOP DROPPED:
 
         llm_html = generate_llm_insights_strict(payload)
 
-        # Build full email HTML + CSV
         html = build_weekly_email_html(
             project_name=project_name,
             domain=project_domain,
