@@ -788,8 +788,9 @@ def build_weekly_email_html(
         </tr>
         {kpi_row("Clicks", gsc_prev.get("clicks",0), gsc_curr.get("clicks",0))}
         {kpi_row("Impressions", gsc_prev.get("impressions",0), gsc_curr.get("impressions",0))}
-        {kpi_row("CTR", f"{gsc_prev.get('ctr',0.0)*100:.2f}%", f"{gsc_curr.get('ctr',0.0)*100:.2f}%"))}
-        {kpi_row("Avg Position", f"{gsc_prev.get('position',0.0):.2f}", f"{gsc_curr.get('position',0.0):.2f}"))}
+        {kpi_row("CTR", f"{gsc_prev.get('ctr',0.0)*100:.2f}%", f"{gsc_curr.get('ctr',0.0)*100:.2f}%")}
+        {kpi_row("Avg Position", f"{gsc_prev.get('position',0.0):.2f}", f"{gsc_curr.get('position',0.0):.2f}")}
+
       </table>
 
       {top_table("Top Queries (Current Week)", gsc_top_queries, "query")}
