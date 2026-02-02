@@ -6,53 +6,18 @@ import ssl
 import time
 import json
 import sqlite3
-import tempfile
+import smtplib
 import requests
 from datetime import datetime, date, timedelta
 from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
 from email.message import EmailMessage
-import smtplib
 
-# ------------------- ENV -------------------
-# Local dev: loads .env (Streamlit Cloud: secrets are used instead)
-load_dotenv()
-
-def _get_setting(key: str, default: str = "") -> str:
-    """
-    Read from st.secrets first (Streamlit Cloud), fallback to env (local).
-    """
-    try:
-        if key in st.secrets:
-            return str(st.secrets.get(key, default)).strip()
-    except Exception:
-        pass
-    return os.getenv(key, default).strip()
-
-SERPAPI_KEY = _get_setting("SERPAPI_KEY")
-OPENAI_API_KEY = _get_setting("OPENAI_API_KEY")
-
-# SMTP
-SMTP_HOST = _get_setting("SMTP_HOST")
-SMTP_PORT = int(_get_setting("SMTP_PORT", "587") or "587")
-SMTP_USER = _get_setting("SMTP_USER")
-SMTP_PASS = _get_setting("SMTP_PASS")
-MAIL_FROM = _get_setting("MAIL_FROM")
-REPORT_TO = [x.strip() for x in _get_setting("REPORT_TO").split(",") if x.strip()]
-REPORT_CC = [x.strip() for x in _get_setting("REPORT_CC").split(",") if x.strip()]
-
-# Google (config)
-GSC_SITE_URL = _get_setting("GSC_SITE_URL")
-GA4_PROPERTY_ID = _get_setting("GA4_PROPERTY_ID")
-GOOGLE_SERVICE_ACCOUNT_JSON = _get_setting("GOOGLE_SERVICE_ACCOUNT_JSON")
-
-# DB
-DB = _get_setting("SQLITE_DB", "rank_history.db") or "rank_history.db"
-
-# ------------------- GOOGLE IMPORTS -------------------
+# -----------------------------
+# Optional Google libs
+# -----------------------------
 GOOGLE_OK = True
 try:
     from google.oauth2 import service_account
@@ -62,23 +27,65 @@ try:
 except Exception:
     GOOGLE_OK = False
 
-# ------------------- HELPERS -------------------
-def normalize_domain(domain: str) -> str:
-    d = (domain or "").strip().lower()
-    d = d.replace("https://", "").replace("http://", "").strip("/")
-    d = d.replace("www.", "")
-    return d
 
-def domain_match(target_domain: str, url: str) -> bool:
-    td = normalize_domain(target_domain)
-    raw = (url or "").strip()
-    if not raw:
-        return False
-    parsed = urlparse(raw)
-    netloc = (parsed.netloc or "").lower().replace("www.", "")
-    if not netloc:
-        netloc = normalize_domain(raw).split("/")[0]
-    return netloc == td or netloc.endswith("." + td)
+# =========================================================
+# Secrets / Env loader (Streamlit Cloud + local .env both)
+# =========================================================
+def _get_secret(key: str, default=""):
+    # Streamlit Cloud secrets
+    try:
+        if key in st.secrets:
+            return str(st.secrets.get(key, default)).strip()
+    except Exception:
+        pass
+    # Environment variables
+    return str(os.getenv(key, default)).strip()
+
+
+SERPAPI_KEY = _get_secret("SERPAPI_KEY", "")
+OPENAI_API_KEY = _get_secret("OPENAI_API_KEY", "")
+
+SMTP_HOST = _get_secret("SMTP_HOST", "")
+SMTP_PORT = int(_get_secret("SMTP_PORT", "587") or "587")
+SMTP_USER = _get_secret("SMTP_USER", "")
+SMTP_PASS = _get_secret("SMTP_PASS", "")
+MAIL_FROM = _get_secret("MAIL_FROM", "")
+REPORT_TO = [x.strip() for x in _get_secret("REPORT_TO", "").split(",") if x.strip()]
+REPORT_CC = [x.strip() for x in _get_secret("REPORT_CC", "").split(",") if x.strip()]
+
+GSC_SITE_URL = _get_secret("GSC_SITE_URL", "")
+GA4_PROPERTY_ID = _get_secret("GA4_PROPERTY_ID", "")
+
+# Store Service Account JSON in secrets as a string
+GOOGLE_SERVICE_ACCOUNT_JSON = _get_secret("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+
+DB = _get_secret("SQLITE_DB", "rank_history.db") or "rank_history.db"
+
+
+# =========================================================
+# Helpers
+# =========================================================
+def today_local() -> date:
+    return datetime.now().date()
+
+def last_full_week_range() -> tuple[date, date]:
+    """
+    last completed Monday-Sunday
+    """
+    t = today_local()
+    # weekday: Mon=0..Sun=6
+    days_since_sun = (t.weekday() - 6) % 7
+    last_sun = t - timedelta(days=days_since_sun or 7)
+    last_mon = last_sun - timedelta(days=6)
+    return last_mon, last_sun
+
+def daterange(ws: date, we: date):
+    d = ws
+    out = []
+    while d <= we:
+        out.append(d)
+        d += timedelta(days=1)
+    return out
 
 def html_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -91,6 +98,36 @@ def safe_float(x) -> float:
 
 def fmt_pos(p: float) -> str:
     return f"{p:.0f}" if p and p > 0 else "NR"
+
+def normalize_domain(domain: str) -> str:
+    d = (domain or "").strip().lower()
+    d = d.replace("https://", "").replace("http://", "").strip("/")
+    d = d.replace("www.", "")
+    # remove any path
+    d = d.split("/")[0]
+    return d
+
+def domain_match(target_domain: str, url: str) -> bool:
+    """
+    More tolerant match:
+    - handles http/https, www
+    - handles subdomains
+    """
+    td = normalize_domain(target_domain)
+    raw = (url or "").strip()
+    if not raw:
+        return False
+
+    try:
+        parsed = urlparse(raw)
+        netloc = (parsed.netloc or "").lower().replace("www.", "")
+        if not netloc:
+            # sometimes urlparse fails for weird formats
+            netloc = normalize_domain(raw)
+        # exact or subdomain
+        return netloc == td or netloc.endswith("." + td)
+    except Exception:
+        return False
 
 def google_domain_from_gl(gl: str) -> str:
     gl = (gl or "").lower().strip()
@@ -110,60 +147,10 @@ def google_domain_from_gl(gl: str) -> str:
     }
     return special.get(gl, "google.com")
 
-def today_local() -> date:
-    return datetime.now().date()
 
-def last_full_week_range() -> tuple[date, date]:
-    """
-    Last completed Mon-Sun week.
-    """
-    t = today_local()
-    # Find last Sunday
-    days_since_sun = (t.weekday() - 6) % 7
-    last_sun = t - timedelta(days=days_since_sun or 7)
-    last_mon = last_sun - timedelta(days=6)
-    return last_mon, last_sun
-
-def daterange(ws: date, we: date):
-    d = ws
-    out = []
-    while d <= we:
-        out.append(d)
-        d += timedelta(days=1)
-    return out
-
-# ------------------- STREAMLIT CLOUD GOOGLE CREDS -------------------
-def ensure_google_application_credentials() -> str | None:
-    """
-    Streamlit Cloud doesn't have credential files.
-    We store service account JSON in secrets/env and write to temp file.
-    """
-    # If a valid file path already exists (local machine case)
-    existing = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    if existing and os.path.exists(existing):
-        return existing
-
-    raw = (GOOGLE_SERVICE_ACCOUNT_JSON or "").strip()
-    if not raw:
-        return None
-
-    # Validate it's JSON
-    try:
-        json.loads(raw)
-    except Exception:
-        # Sometimes users paste with trailing spaces; still invalid => return None
-        return None
-
-    tmp_path = os.path.join(tempfile.gettempdir(), "service-account.json")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(raw)
-
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_path
-    return tmp_path
-
-GOOGLE_CRED_FILE = ensure_google_application_credentials()
-
-# ------------------- DB SCHEMA + MIGRATION -------------------
+# =========================================================
+# DB (auto-migrate)
+# =========================================================
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS daily_ranks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,99 +164,63 @@ CREATE TABLE IF NOT EXISTS daily_ranks (
   position REAL DEFAULT 0,
   url TEXT DEFAULT '',
   source TEXT DEFAULT '',
-  created_at TEXT NOT NULL,
-  UNIQUE(checked_date, project_domain, keyword, location, gl, hl, device)
+  created_at TEXT NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_ranks
+ON daily_ranks(checked_date, project_domain, keyword, location, gl, hl, device);
 
 CREATE INDEX IF NOT EXISTS idx_daily_ranks_date ON daily_ranks(checked_date);
 CREATE INDEX IF NOT EXISTS idx_daily_ranks_domain ON daily_ranks(project_domain);
 """
 
-def _table_columns(con, table: str) -> set[str]:
-    cols = set()
-    for r in con.execute(f"PRAGMA table_info({table})").fetchall():
-        cols.add(r[1])
-    return cols
-
-def migrate_db_if_needed(con: sqlite3.Connection):
-    """
-    Fix old DB that doesn't have 'project_domain' (or other missing columns).
-    We'll rebuild table safely if required.
-    """
-    con.execute("CREATE TABLE IF NOT EXISTS __migrations (name TEXT PRIMARY KEY, applied_at TEXT)")
-    # If no table yet, schema script handles it
-    con.executescript(SCHEMA_SQL)
-
-    cols = _table_columns(con, "daily_ranks")
-    required = {
-        "checked_date", "project_domain", "keyword", "location", "gl", "hl",
-        "device", "position", "url", "source", "created_at"
-    }
-
-    if required.issubset(cols):
-        return  # OK
-
-    # Rebuild table
-    con.execute("ALTER TABLE daily_ranks RENAME TO daily_ranks_old")
-
-    con.executescript(SCHEMA_SQL)
-
-    old_cols = _table_columns(con, "daily_ranks_old")
-    # Map best-effort columns from old to new
-    # If old DB didn't have project_domain, we set it to '' (it will still store new rows correctly).
-    select_cols = []
-    insert_cols = [
-        "checked_date", "project_domain", "keyword", "location", "gl", "hl",
-        "device", "position", "url", "source", "created_at"
-    ]
-
-    def pick(name, fallback_literal=None):
-        if name in old_cols:
-            return name
-        if fallback_literal is not None:
-            return fallback_literal
-        return "''"
-
-    select_cols = [
-        pick("checked_date"),
-        pick("project_domain", "''"),
-        pick("keyword"),
-        pick("location", "''"),
-        pick("gl", "''"),
-        pick("hl", "''"),
-        pick("device", "'desktop'"),
-        pick("position", "0"),
-        pick("url", "''"),
-        pick("source", "''"),
-        pick("created_at", "''"),
-    ]
-
-    con.execute(
-        f"""
-        INSERT OR IGNORE INTO daily_ranks ({",".join(insert_cols)})
-        SELECT {",".join(select_cols)} FROM daily_ranks_old
-        """
-    )
-    con.execute("DROP TABLE daily_ranks_old")
-    con.execute(
-        "INSERT OR REPLACE INTO __migrations (name, applied_at) VALUES (?, ?)",
-        ("rebuild_daily_ranks_v1", datetime.utcnow().isoformat()),
-    )
-    con.commit()
+REQUIRED_COLUMNS = {
+    "checked_date": "TEXT",
+    "project_domain": "TEXT",
+    "keyword": "TEXT",
+    "location": "TEXT",
+    "gl": "TEXT",
+    "hl": "TEXT",
+    "device": "TEXT",
+    "position": "REAL",
+    "url": "TEXT",
+    "source": "TEXT",
+    "created_at": "TEXT",
+}
 
 def db_connect():
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
-    migrate_db_if_needed(con)
+    con.executescript(SCHEMA_SQL)
+    _db_migrate_columns(con, "daily_ranks", REQUIRED_COLUMNS)
     return con
+
+def _db_migrate_columns(con, table: str, cols: dict):
+    """
+    If old DB exists without columns, add them safely.
+    Prevents: sqlite3.OperationalError: no such column
+    """
+    existing = set()
+    rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+    for r in rows:
+        existing.add(r["name"])
+    for c, ctype in cols.items():
+        if c not in existing:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {c} {ctype}")
+    con.commit()
 
 def upsert_daily_rank(con, checked_date, project_domain, keyword, location, gl, hl, device, position, url, source):
     con.execute(
         """
-        INSERT INTO daily_ranks (checked_date, project_domain, keyword, location, gl, hl, device, position, url, source, created_at)
+        INSERT INTO daily_ranks
+        (checked_date, project_domain, keyword, location, gl, hl, device, position, url, source, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(checked_date, project_domain, keyword, location, gl, hl, device)
-        DO UPDATE SET position=excluded.position, url=excluded.url, source=excluded.source, created_at=excluded.created_at
+        DO UPDATE SET
+          position=excluded.position,
+          url=excluded.url,
+          source=excluded.source,
+          created_at=excluded.created_at
         """,
         (
             checked_date,
@@ -319,7 +270,10 @@ def get_min_max_dates(con, project_domain):
         return None, None
     return date.fromisoformat(row["mn"]), date.fromisoformat(row["mx"])
 
-# ------------------- LOCATION RESOLVE (SerpAPI) -------------------
+
+# =========================================================
+# SerpAPI location resolve
+# =========================================================
 def resolve_location_serpapi(api_key: str, query: str) -> dict:
     query = (query or "").strip()
     if not query:
@@ -342,7 +296,10 @@ def resolve_location_serpapi(api_key: str, query: str) -> dict:
     except Exception:
         return {"ok": False, "location": query, "gl": ""}
 
-# ------------------- SERPAPI RANK -------------------
+
+# =========================================================
+# SerpAPI rank fetch (Top 100) with correct pagination rank
+# =========================================================
 def serpapi_get_rank(
     serpapi_key: str,
     keyword: str,
@@ -351,8 +308,13 @@ def serpapi_get_rank(
     hl: str,
     device: str,
     location: str,
-    top_n: int = 100
+    top_n: int = 100,
+    debug_collect=False,
 ) -> dict:
+    """
+    Computes rank across pages using start offset + index.
+    Returns global position, url, source.
+    """
     google_domain = google_domain_from_gl(gl)
     params = {
         "api_key": serpapi_key,
@@ -367,32 +329,56 @@ def serpapi_get_rank(
     if location:
         params["location"] = location
 
-    # paginate 0..90 (top 100)
-    for start in range(0, min(top_n, 100), 10):
+    debug_rows = []
+
+    # paginate 0..90
+    max_start = min(max(top_n, 10), 100)
+    for start in range(0, max_start, 10):
         params["start"] = start
         r = requests.get("https://serpapi.com/search.json", params=params, timeout=60)
         r.raise_for_status()
         data = r.json()
 
+        if "error" in data:
+            return {"position": 0.0, "url": "", "source": f"serpapi_error:{data['error']}", "debug": debug_rows}
+
         organic = data.get("organic_results", []) or []
-        for item in organic:
-            pos = item.get("position")
+        # Some responses may not include 'position'. Use start+index fallback.
+        for idx, item in enumerate(organic, start=1):
             link = item.get("link") or item.get("url") or ""
-            if pos and link and domain_match(target_domain, link):
-                return {"position": float(pos), "url": link, "source": "organic"}
+            pos = item.get("position")
+            global_pos = float(pos) if pos else float(start + idx)
+
+            if debug_collect:
+                debug_rows.append({"pos": global_pos, "url": link})
+
+            if link and domain_match(target_domain, link):
+                return {"position": global_pos, "url": link, "source": "organic", "debug": debug_rows}
 
         time.sleep(0.35)
 
-    return {"position": 0.0, "url": "", "source": "not_found"}
+    return {"position": 0.0, "url": "", "source": "not_found", "debug": debug_rows}
 
-# ------------------- GOOGLE (GSC + GA4) -------------------
-def _google_creds(sa_file: str, scopes: list[str]):
+
+# =========================================================
+# Google creds from JSON string (Streamlit secrets)
+# =========================================================
+def _google_creds_from_json(sa_json_str: str, scopes: list[str]):
     if not GOOGLE_OK:
         raise RuntimeError("Google libs missing. Install: google-api-python-client google-auth google-analytics-data")
-    return service_account.Credentials.from_service_account_file(sa_file, scopes=scopes)
 
-def gsc_totals(sa_file: str, site_url: str, start_date: str, end_date: str) -> dict:
-    creds = _google_creds(sa_file, ["https://www.googleapis.com/auth/webmasters.readonly"])
+    if not sa_json_str.strip():
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON missing in secrets.")
+
+    try:
+        data = json.loads(sa_json_str)
+    except Exception as e:
+        raise RuntimeError(f"Invalid GOOGLE_SERVICE_ACCOUNT_JSON (must be valid JSON). Error: {e}")
+
+    return service_account.Credentials.from_service_account_info(data, scopes=scopes)
+
+def gsc_totals(sa_json: str, site_url: str, start_date: str, end_date: str) -> dict:
+    creds = _google_creds_from_json(sa_json, ["https://www.googleapis.com/auth/webmasters.readonly"])
     svc = gbuild("searchconsole", "v1", credentials=creds, cache_discovery=False)
 
     body = {"startDate": start_date, "endDate": end_date, "dimensions": [], "rowLimit": 1}
@@ -408,8 +394,8 @@ def gsc_totals(sa_file: str, site_url: str, start_date: str, end_date: str) -> d
         "position": float(r.get("position", 0.0)),
     }
 
-def gsc_top(sa_file: str, site_url: str, start_date: str, end_date: str, dim: str, limit: int = 10):
-    creds = _google_creds(sa_file, ["https://www.googleapis.com/auth/webmasters.readonly"])
+def gsc_top(sa_json: str, site_url: str, start_date: str, end_date: str, dim: str, limit: int = 10):
+    creds = _google_creds_from_json(sa_json, ["https://www.googleapis.com/auth/webmasters.readonly"])
     svc = gbuild("searchconsole", "v1", credentials=creds, cache_discovery=False)
 
     body = {"startDate": start_date, "endDate": end_date, "dimensions": [dim], "rowLimit": int(limit), "startRow": 0}
@@ -427,8 +413,8 @@ def gsc_top(sa_file: str, site_url: str, start_date: str, end_date: str, dim: st
         })
     return out
 
-def ga4_totals(sa_file: str, property_id: str, start_date: str, end_date: str) -> dict:
-    creds = _google_creds(sa_file, ["https://www.googleapis.com/auth/analytics.readonly"])
+def ga4_totals(sa_json: str, property_id: str, start_date: str, end_date: str) -> dict:
+    creds = _google_creds_from_json(sa_json, ["https://www.googleapis.com/auth/analytics.readonly"])
     client = BetaAnalyticsDataClient(credentials=creds)
 
     req = RunReportRequest(
@@ -455,8 +441,8 @@ def ga4_totals(sa_file: str, property_id: str, start_date: str, end_date: str) -
         "conversions": float(vals[4].value or 0.0),
     }
 
-def ga4_organic_sessions(sa_file: str, property_id: str, start_date: str, end_date: str) -> int:
-    creds = _google_creds(sa_file, ["https://www.googleapis.com/auth/analytics.readonly"])
+def ga4_organic_sessions(sa_json: str, property_id: str, start_date: str, end_date: str) -> int:
+    creds = _google_creds_from_json(sa_json, ["https://www.googleapis.com/auth/analytics.readonly"])
     client = BetaAnalyticsDataClient(credentials=creds)
 
     req = RunReportRequest(
@@ -475,8 +461,14 @@ def ga4_organic_sessions(sa_file: str, property_id: str, start_date: str, end_da
             break
     return organic
 
-# ------------------- MATRIX / WEEK CALCS -------------------
+
+# =========================================================
+# Weekly calculations
+# =========================================================
 def build_matrix(rows: list[dict], days: list[date]) -> dict:
+    """
+    key=(keyword, location, device) -> map day->pos/url/source
+    """
     m = {}
     for r in rows:
         k = (r["keyword"], r.get("location", ""), r.get("device", "desktop"))
@@ -522,6 +514,7 @@ def movers_vs_prev(curr_matrix: dict, prev_matrix: dict, limit=20):
     for k in keys:
         cb = best_pos_for_period(curr_matrix.get(k, {})) if k in curr_matrix else 0.0
         pb = best_pos_for_period(prev_matrix.get(k, {})) if k in prev_matrix else 0.0
+
         if cb > 0 and pb > 0:
             delta = cb - pb
         elif cb > 0 and pb == 0:
@@ -540,10 +533,13 @@ def movers_vs_prev(curr_matrix: dict, prev_matrix: dict, limit=20):
     downs = sorted([m for m in movers if m["delta"] > 0], key=lambda x: x["delta"], reverse=True)[:limit]
     return ups, downs
 
-# ------------------- EMAIL -------------------
+
+# =========================================================
+# Email sending
+# =========================================================
 def send_email(subject: str, html_body: str, csv_bytes: bytes, csv_filename: str):
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and REPORT_TO):
-        raise RuntimeError("SMTP settings missing (check Streamlit Secrets or .env).")
+        raise RuntimeError("SMTP settings missing in secrets/env")
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -562,7 +558,10 @@ def send_email(subject: str, html_body: str, csv_bytes: bytes, csv_filename: str
         s.login(SMTP_USER, SMTP_PASS)
         s.send_message(msg)
 
-# ------------------- LLM INSIGHTS (STRICT) -------------------
+
+# =========================================================
+# LLM insights (STRICT)
+# =========================================================
 def clean_llm_html(s: str) -> str:
     if not s:
         return ""
@@ -574,6 +573,7 @@ def clean_llm_html(s: str) -> str:
 def generate_llm_insights_strict(payload_text: str) -> str:
     if not OPENAI_API_KEY:
         return ""
+
     try:
         from openai import OpenAI
     except Exception:
@@ -582,9 +582,9 @@ def generate_llm_insights_strict(payload_text: str) -> str:
     prompt = f"""
 You are an SEO analyst. You MUST ONLY use the numbers and facts from the data provided.
 DO NOT invent metrics. DO NOT assume improvements if not shown.
-Write a weekly SEO summary in HTML, suitable for a business owner.
+Write a weekly SEO summary in HTML for a business owner.
 
-Output structure:
+Output:
 <h3>AI Insights</h3>
 <p>Key highlights...</p>
 <ul><li>...</li></ul>
@@ -609,7 +609,94 @@ Return ONLY HTML.
     except Exception:
         return ""
 
-# ------------------- WEEKLY EMAIL BUILDERS -------------------
+
+# =========================================================
+# Weekly HTML + CSV builders (NO risky nested f-strings)
+# =========================================================
+def kpi_row(label, prev_val, curr_val):
+    return (
+        "<tr>"
+        f"<td style='border:1px solid #ddd;'>{html_escape(str(label))}</td>"
+        f"<td style='border:1px solid #ddd;text-align:right;'>{html_escape(str(prev_val))}</td>"
+        f"<td style='border:1px solid #ddd;text-align:right;'><b>{html_escape(str(curr_val))}</b></td>"
+        "</tr>"
+    )
+
+def top_table(title: str, rows: list[dict], keyname: str) -> str:
+    trs = ""
+    for r in rows[:10]:
+        name = r.get(keyname, "")
+        trs += (
+            "<tr>"
+            f"<td style='border:1px solid #ddd;'>{html_escape(str(name))}</td>"
+            f"<td style='border:1px solid #ddd;text-align:right;'>{r.get('clicks',0)}</td>"
+            f"<td style='border:1px solid #ddd;text-align:right;'>{r.get('impressions',0)}</td>"
+            f"<td style='border:1px solid #ddd;text-align:right;'>{r.get('ctr',0.0)*100:.2f}%</td>"
+            f"<td style='border:1px solid #ddd;text-align:right;'>{r.get('position',0.0):.2f}</td>"
+            "</tr>"
+        )
+
+    if not trs:
+        trs = "<tr><td colspan='5' style='border:1px solid #ddd;color:#777;'>No data</td></tr>"
+
+    return (
+        f"<h4 style='margin:12px 0 6px;'>{html_escape(title)}</h4>"
+        "<table cellpadding='7' cellspacing='0' border='0' style='border-collapse:collapse;width:100%;max-width:980px;'>"
+        "<tr style='background:#f4f4f4;'>"
+        f"<th style='border:1px solid #ddd;text-align:left;'>{html_escape(keyname.title())}</th>"
+        "<th style='border:1px solid #ddd;text-align:right;'>Clicks</th>"
+        "<th style='border:1px solid #ddd;text-align:right;'>Impr</th>"
+        "<th style='border:1px solid #ddd;text-align:right;'>CTR</th>"
+        "<th style='border:1px solid #ddd;text-align:right;'>Pos</th>"
+        "</tr>"
+        f"{trs}"
+        "</table>"
+    )
+
+def movers_table(title: str, rows: list[dict]) -> str:
+    trs = ""
+    for m in rows[:10]:
+        if m["delta"] == -9999:
+            delta_txt = "NEW"
+            trend = "▲"
+        elif m["delta"] == 9999:
+            delta_txt = "LOST"
+            trend = "▼"
+        else:
+            delta_txt = f"{int(m['delta']):+d}"
+            trend = "▲" if m["delta"] < 0 else ("▼" if m["delta"] > 0 else "●")
+
+        trs += (
+            "<tr>"
+            f"<td style='border:1px solid #ddd;'>{html_escape(m['keyword'])}</td>"
+            f"<td style='border:1px solid #ddd;'>{html_escape(m['location'])}</td>"
+            f"<td style='border:1px solid #ddd;'>{html_escape(m['device'])}</td>"
+            f"<td style='border:1px solid #ddd;text-align:center;'>{fmt_pos(m['prev_best'])}</td>"
+            f"<td style='border:1px solid #ddd;text-align:center;'>{fmt_pos(m['curr_best'])}</td>"
+            f"<td style='border:1px solid #ddd;text-align:center;'><b>{trend}</b></td>"
+            f"<td style='border:1px solid #ddd;text-align:center;'>{html_escape(delta_txt)}</td>"
+            "</tr>"
+        )
+
+    if not trs:
+        trs = "<tr><td colspan='7' style='border:1px solid #ddd;color:#777;'>No data</td></tr>"
+
+    return (
+        f"<h3 style='margin:18px 0 8px;'>{html_escape(title)}</h3>"
+        "<table cellpadding='8' cellspacing='0' border='0' style='border-collapse:collapse;width:100%;max-width:980px;'>"
+        "<tr style='background:#f4f4f4;'>"
+        "<th style='border:1px solid #ddd;text-align:left;'>Keyword</th>"
+        "<th style='border:1px solid #ddd;text-align:left;'>Location</th>"
+        "<th style='border:1px solid #ddd;text-align:left;'>Device</th>"
+        "<th style='border:1px solid #ddd;'>Prev Best</th>"
+        "<th style='border:1px solid #ddd;'>Curr Best</th>"
+        "<th style='border:1px solid #ddd;'>Trend</th>"
+        "<th style='border:1px solid #ddd;'>Δ</th>"
+        "</tr>"
+        f"{trs}"
+        "</table>"
+    )
+
 def build_weekly_email_html(
     project_name: str,
     domain: str,
@@ -633,86 +720,12 @@ def build_weekly_email_html(
     prev_sum = summarize_week(prev_matrix, expected_keywords)
     ups, downs = movers_vs_prev(curr_matrix, prev_matrix, limit=15)
 
-    def kpi_row(label, prev_val, curr_val):
-        return f"""
-        <tr>
-          <td style="border:1px solid #ddd;">{html_escape(label)}</td>
-          <td style="border:1px solid #ddd;text-align:right;">{html_escape(str(prev_val))}</td>
-          <td style="border:1px solid #ddd;text-align:right;"><b>{html_escape(str(curr_val))}</b></td>
-        </tr>
-        """
+    # day-wise table headers
+    day_headers = "".join(
+        [f"<th style='border:1px solid #ddd;background:#f4f4f4;'>{d.strftime('%a')}<br>{d.strftime('%d-%b')}</th>" for d in curr_days]
+    )
 
-    def top_table(title: str, rows: list[dict], keyname: str) -> str:
-        trs = ""
-        for r in rows[:10]:
-            name = r.get(keyname, "")
-            trs += f"""
-            <tr>
-              <td style="border:1px solid #ddd;">{html_escape(name)}</td>
-              <td style="border:1px solid #ddd;text-align:right;">{r.get("clicks",0)}</td>
-              <td style="border:1px solid #ddd;text-align:right;">{r.get("impressions",0)}</td>
-              <td style="border:1px solid #ddd;text-align:right;">{r.get("ctr",0.0)*100:.2f}%</td>
-              <td style="border:1px solid #ddd;text-align:right;">{r.get("position",0.0):.2f}</td>
-            </tr>
-            """
-        return f"""
-        <h4 style="margin:12px 0 6px;">{html_escape(title)}</h4>
-        <table cellpadding="7" cellspacing="0" border="0" style="border-collapse:collapse;width:100%;max-width:980px;">
-          <tr style="background:#f4f4f4;">
-            <th style="border:1px solid #ddd;text-align:left;">{html_escape(keyname.title())}</th>
-            <th style="border:1px solid #ddd;text-align:right;">Clicks</th>
-            <th style="border:1px solid #ddd;text-align:right;">Impr</th>
-            <th style="border:1px solid #ddd;text-align:right;">CTR</th>
-            <th style="border:1px solid #ddd;text-align:right;">Pos</th>
-          </tr>
-          {trs if trs else "<tr><td colspan='5' style='border:1px solid #ddd;color:#777;'>No data</td></tr>"}
-        </table>
-        """
-
-    def movers_table(title: str, rows: list[dict]) -> str:
-        trs = ""
-        for m in rows[:10]:
-            if m["delta"] == -9999:
-                delta_txt = "NEW"
-                trend = "▲"
-            elif m["delta"] == 9999:
-                delta_txt = "LOST"
-                trend = "▼"
-            else:
-                delta_txt = f"{int(m['delta']):+d}"
-                trend = "▲" if m["delta"] < 0 else ("▼" if m["delta"] > 0 else "●")
-            trs += f"""
-            <tr>
-              <td style="border:1px solid #ddd;">{html_escape(m['keyword'])}</td>
-              <td style="border:1px solid #ddd;">{html_escape(m['location'])}</td>
-              <td style="border:1px solid #ddd;">{html_escape(m['device'])}</td>
-              <td style="border:1px solid #ddd;text-align:center;">{fmt_pos(m['prev_best'])}</td>
-              <td style="border:1px solid #ddd;text-align:center;">{fmt_pos(m['curr_best'])}</td>
-              <td style="border:1px solid #ddd;text-align:center;"><b>{trend}</b></td>
-              <td style="border:1px solid #ddd;text-align:center;">{html_escape(delta_txt)}</td>
-            </tr>
-            """
-        return f"""
-        <h3 style="margin:18px 0 8px;">{html_escape(title)}</h3>
-        <table cellpadding="8" cellspacing="0" border="0" style="border-collapse:collapse;width:100%;max-width:980px;">
-          <tr style="background:#f4f4f4;">
-            <th style="border:1px solid #ddd;text-align:left;">Keyword</th>
-            <th style="border:1px solid #ddd;text-align:left;">Location</th>
-            <th style="border:1px solid #ddd;text-align:left;">Device</th>
-            <th style="border:1px solid #ddd;">Prev Best</th>
-            <th style="border:1px solid #ddd;">Curr Best</th>
-            <th style="border:1px solid #ddd;">Trend</th>
-            <th style="border:1px solid #ddd;">Δ</th>
-          </tr>
-          {trs if trs else "<tr><td colspan='7' style='border:1px solid #ddd;color:#777;'>No data</td></tr>"}
-        </table>
-        """
-
-    day_headers = "".join([
-        f"<th style='border:1px solid #ddd;background:#f4f4f4;'>{d.strftime('%a')}<br>{d.strftime('%d-%b')}</th>"
-        for d in curr_days
-    ])
-
+    # day-wise table rows
     daywise_trs = ""
     if curr_matrix:
         def matrix_sort(item):
@@ -738,101 +751,119 @@ def build_weekly_email_html(
                 p = safe_float(dm.get(d.isoformat(), {}).get("pos", 0.0))
                 cells += f"<td style='border:1px solid #ddd;text-align:center;'>{fmt_pos(p)}</td>"
 
-            daywise_trs += f"""
-            <tr>
-              <td style="border:1px solid #ddd;">{html_escape(kw)}</td>
-              <td style="border:1px solid #ddd;">{html_escape(loc)}</td>
-              <td style="border:1px solid #ddd;">{html_escape(dev)}</td>
-              <td style="border:1px solid #ddd;text-align:center;">{fmt_pos(pb)}</td>
-              <td style="border:1px solid #ddd;text-align:center;">{fmt_pos(cb)}</td>
-              <td style="border:1px solid #ddd;text-align:center;"><b>{tr}</b></td>
-              {cells}
-            </tr>
-            """
+            daywise_trs += (
+                "<tr>"
+                f"<td style='border:1px solid #ddd;'>{html_escape(kw)}</td>"
+                f"<td style='border:1px solid #ddd;'>{html_escape(loc)}</td>"
+                f"<td style='border:1px solid #ddd;'>{html_escape(dev)}</td>"
+                f"<td style='border:1px solid #ddd;text-align:center;'>{fmt_pos(pb)}</td>"
+                f"<td style='border:1px solid #ddd;text-align:center;'>{fmt_pos(cb)}</td>"
+                f"<td style='border:1px solid #ddd;text-align:center;'><b>{tr}</b></td>"
+                f"{cells}"
+                "</tr>"
+            )
 
-    html = f"""
-    <html><body style="font-family:Arial, sans-serif; color:#111;">
-      <h2 style="margin:0 0 10px;">Weekly SEO Report — {html_escape(project_name)} ({html_escape(domain)})</h2>
-      <div style="color:#555;margin-bottom:12px;">
-        Current Week: <b>{ws.isoformat()}</b> to <b>{we.isoformat()}</b><br>
-        Previous Week: <b>{prev_ws.isoformat()}</b> to <b>{prev_we.isoformat()}</b>
-      </div>
+    if not daywise_trs:
+        daywise_trs = "<tr><td colspan='50' style='border:1px solid #ddd;color:#777;'>No day-wise data found. Run daily fetch every day.</td></tr>"
 
-      <h3 style="margin:14px 0 8px;">Rank Tracking (SerpAPI)</h3>
-      <table cellpadding="8" cellspacing="0" border="0" style="border-collapse:collapse;width:100%;max-width:980px;">
-        <tr>
-          <td style="border:1px solid #ddd;"><b>Keywords Tracked</b><br>{curr_sum['keywords_tracked']}</td>
-          <td style="border:1px solid #ddd;"><b>Ranked Keywords</b><br>{curr_sum['ranked_keywords']}</td>
-          <td style="border:1px solid #ddd;"><b>Top 3</b><br>{curr_sum['top3']}</td>
-          <td style="border:1px solid #ddd;"><b>Top 10</b><br>{curr_sum['top10']}</td>
-          <td style="border:1px solid #ddd;"><b>Top 20</b><br>{curr_sum['top20']}</td>
-          <td style="border:1px solid #ddd;"><b>Avg Best Pos</b><br>{curr_sum['avg_best_position']:.2f}</td>
-        </tr>
-      </table>
+    # Safe formatted strings
+    gsc_prev_ctr = f"{gsc_prev.get('ctr',0.0)*100:.2f}%"
+    gsc_curr_ctr = f"{gsc_curr.get('ctr',0.0)*100:.2f}%"
+    gsc_prev_pos = f"{gsc_prev.get('position',0.0):.2f}"
+    gsc_curr_pos = f"{gsc_curr.get('position',0.0):.2f}"
 
-      <div style="margin-top:10px;color:#555;">
-        <b>WoW (Rank Summary)</b> —
-        Top10: {prev_sum['top10']} → {curr_sum['top10']},
-        Top3: {prev_sum['top3']} → {curr_sum['top3']},
-        Avg Best Pos: {prev_sum['avg_best_position']:.2f} → {curr_sum['avg_best_position']:.2f}
-      </div>
+    ga_prev_er = f"{ga_prev.get('engagement_rate',0.0)*100:.2f}%"
+    ga_curr_er = f"{ga_curr.get('engagement_rate',0.0)*100:.2f}%"
 
-      {"<div style='margin:16px 0;padding:14px;border-left:4px solid #0b6; background:#f6fffa;'>" + llm_html + "</div>" if llm_html else ""}
+    ai_block = ""
+    if llm_html:
+        ai_block = (
+            "<div style='margin:16px 0;padding:14px;border-left:4px solid #0b6;background:#f6fffa;'>"
+            f"{llm_html}"
+            "</div>"
+        )
 
-      <h3 style="margin:18px 0 8px;">Google Search Console (WoW)</h3>
-      <table cellpadding="8" cellspacing="0" border="0" style="border-collapse:collapse;width:100%;max-width:980px;">
-        <tr style="background:#f4f4f4;">
-          <th style="border:1px solid #ddd;text-align:left;">Metric</th>
-          <th style="border:1px solid #ddd;text-align:right;">Prev Week</th>
-          <th style="border:1px solid #ddd;text-align:right;">Curr Week</th>
-        </tr>
-        {kpi_row("Clicks", gsc_prev.get("clicks",0), gsc_curr.get("clicks",0))}
-        {kpi_row("Impressions", gsc_prev.get("impressions",0), gsc_curr.get("impressions",0))}
-        {kpi_row("CTR", f"{gsc_prev.get('ctr',0.0)*100:.2f}%", f"{gsc_curr.get('ctr',0.0)*100:.2f}%")}
-        {kpi_row("Avg Position", f"{gsc_prev.get('position',0.0):.2f}", f"{gsc_curr.get('position',0.0):.2f}")}
+    html = (
+        "<html><body style='font-family:Arial, sans-serif; color:#111;'>"
+        f"<h2 style='margin:0 0 10px;'>Weekly SEO Report — {html_escape(project_name)} ({html_escape(domain)})</h2>"
+        "<div style='color:#555;margin-bottom:12px;'>"
+        f"Current Week: <b>{ws.isoformat()}</b> to <b>{we.isoformat()}</b><br>"
+        f"Previous Week: <b>{prev_ws.isoformat()}</b> to <b>{prev_we.isoformat()}</b>"
+        "</div>"
 
-      </table>
+        "<h3 style='margin:14px 0 8px;'>Rank Tracking (SerpAPI)</h3>"
+        "<table cellpadding='8' cellspacing='0' border='0' style='border-collapse:collapse;width:100%;max-width:980px;'>"
+        "<tr>"
+        f"<td style='border:1px solid #ddd;'><b>Keywords Tracked</b><br>{curr_sum['keywords_tracked']}</td>"
+        f"<td style='border:1px solid #ddd;'><b>Ranked Keywords</b><br>{curr_sum['ranked_keywords']}</td>"
+        f"<td style='border:1px solid #ddd;'><b>Top 3</b><br>{curr_sum['top3']}</td>"
+        f"<td style='border:1px solid #ddd;'><b>Top 10</b><br>{curr_sum['top10']}</td>"
+        f"<td style='border:1px solid #ddd;'><b>Top 20</b><br>{curr_sum['top20']}</td>"
+        f"<td style='border:1px solid #ddd;'><b>Avg Best Pos</b><br>{curr_sum['avg_best_position']:.2f}</td>"
+        "</tr>"
+        "</table>"
 
-      {top_table("Top Queries (Current Week)", gsc_top_queries, "query")}
-      {top_table("Top Pages (Current Week)", gsc_top_pages, "page")}
+        "<div style='margin-top:10px;color:#555;'>"
+        "<b>WoW (Rank Summary)</b> — "
+        f"Top10: {prev_sum['top10']} → {curr_sum['top10']}, "
+        f"Top3: {prev_sum['top3']} → {curr_sum['top3']}, "
+        f"Avg Best Pos: {prev_sum['avg_best_position']:.2f} → {curr_sum['avg_best_position']:.2f}"
+        "</div>"
 
-      <h3 style="margin:18px 0 8px;">Google Analytics (GA4) (WoW)</h3>
-      <table cellpadding="8" cellspacing="0" border="0" style="border-collapse:collapse;width:100%;max-width:980px;">
-        <tr style="background:#f4f4f4;">
-          <th style="border:1px solid #ddd;text-align:left;">Metric</th>
-          <th style="border:1px solid #ddd;text-align:right;">Prev Week</th>
-          <th style="border:1px solid #ddd;text-align:right;">Curr Week</th>
-        </tr>
-        {kpi_row("Users", ga_prev.get("users",0), ga_curr.get("users",0))}
-        {kpi_row("Sessions", ga_prev.get("sessions",0), ga_curr.get("sessions",0))}
-        {kpi_row("Organic Sessions", ga_prev_org, ga_curr_org)}
-        {kpi_row("Engaged Sessions", ga_prev.get("engaged_sessions",0), ga_curr.get("engaged_sessions",0))}
-        {kpi_row("Engagement Rate", f"{ga_prev.get('engagement_rate',0.0)*100:.2f}%", f"{ga_curr.get('engagement_rate',0.0)*100:.2f}%"))}
-        {kpi_row("Conversions", ga_prev.get("conversions",0.0), ga_curr.get("conversions",0.0))}
-      </table>
+        f"{ai_block}"
 
-      {movers_table("Keywords Improved (Top movers)", ups)}
-      {movers_table("Keywords Dropped (Top movers)", downs)}
+        "<h3 style='margin:18px 0 8px;'>Google Search Console (WoW)</h3>"
+        "<table cellpadding='8' cellspacing='0' border='0' style='border-collapse:collapse;width:100%;max-width:980px;'>"
+        "<tr style='background:#f4f4f4;'>"
+        "<th style='border:1px solid #ddd;text-align:left;'>Metric</th>"
+        "<th style='border:1px solid #ddd;text-align:right;'>Prev Week</th>"
+        "<th style='border:1px solid #ddd;text-align:right;'>Curr Week</th>"
+        "</tr>"
+        f"{kpi_row('Clicks', gsc_prev.get('clicks',0), gsc_curr.get('clicks',0))}"
+        f"{kpi_row('Impressions', gsc_prev.get('impressions',0), gsc_curr.get('impressions',0))}"
+        f"{kpi_row('CTR', gsc_prev_ctr, gsc_curr_ctr)}"
+        f"{kpi_row('Avg Position', gsc_prev_pos, gsc_curr_pos)}"
+        "</table>"
+        f"{top_table('Top Queries (Current Week)', gsc_top_queries, 'query')}"
+        f"{top_table('Top Pages (Current Week)', gsc_top_pages, 'page')}"
 
-      <h3 style="margin:18px 0 8px;">Day-wise Ranks (Current Week)</h3>
-      <table cellpadding="7" cellspacing="0" border="0" style="border-collapse:collapse;width:100%;max-width:980px;">
-        <tr style="background:#f4f4f4;">
-          <th style="border:1px solid #ddd;text-align:left;">Keyword</th>
-          <th style="border:1px solid #ddd;text-align:left;">Location</th>
-          <th style="border:1px solid #ddd;text-align:left;">Device</th>
-          <th style="border:1px solid #ddd;">Prev Best</th>
-          <th style="border:1px solid #ddd;">Curr Best</th>
-          <th style="border:1px solid #ddd;">Trend</th>
-          {day_headers}
-        </tr>
-        {daywise_trs if daywise_trs else "<tr><td colspan='50' style='border:1px solid #ddd;color:#777;'>No day-wise rank data found for this week. Run Daily Fetch every day.</td></tr>"}
-      </table>
+        "<h3 style='margin:18px 0 8px;'>Google Analytics (GA4) (WoW)</h3>"
+        "<table cellpadding='8' cellspacing='0' border='0' style='border-collapse:collapse;width:100%;max-width:980px;'>"
+        "<tr style='background:#f4f4f4;'>"
+        "<th style='border:1px solid #ddd;text-align:left;'>Metric</th>"
+        "<th style='border:1px solid #ddd;text-align:right;'>Prev Week</th>"
+        "<th style='border:1px solid #ddd;text-align:right;'>Curr Week</th>"
+        "</tr>"
+        f"{kpi_row('Users', ga_prev.get('users',0), ga_curr.get('users',0))}"
+        f"{kpi_row('Sessions', ga_prev.get('sessions',0), ga_curr.get('sessions',0))}"
+        f"{kpi_row('Organic Sessions', ga_prev_org, ga_curr_org)}"
+        f"{kpi_row('Engaged Sessions', ga_prev.get('engaged_sessions',0), ga_curr.get('engaged_sessions',0))}"
+        f"{kpi_row('Engagement Rate', ga_prev_er, ga_curr_er)}"
+        f"{kpi_row('Conversions', ga_prev.get('conversions',0.0), ga_curr.get('conversions',0.0))}"
+        "</table>"
 
-      <div style="color:#777;margin-top:10px;font-size:12px;">
-        Notes: NR = Not Ranked. For accurate day-wise ranks, run Daily Fetch once per day.
-      </div>
-    </body></html>
-    """
+        f"{movers_table('Keywords Improved (Top movers)', ups)}"
+        f"{movers_table('Keywords Dropped (Top movers)', downs)}"
+
+        "<h3 style='margin:18px 0 8px;'>Day-wise Ranks (Current Week)</h3>"
+        "<table cellpadding='7' cellspacing='0' border='0' style='border-collapse:collapse;width:100%;max-width:980px;'>"
+        "<tr style='background:#f4f4f4;'>"
+        "<th style='border:1px solid #ddd;text-align:left;'>Keyword</th>"
+        "<th style='border:1px solid #ddd;text-align:left;'>Location</th>"
+        "<th style='border:1px solid #ddd;text-align:left;'>Device</th>"
+        "<th style='border:1px solid #ddd;'>Prev Best</th>"
+        "<th style='border:1px solid #ddd;'>Curr Best</th>"
+        "<th style='border:1px solid #ddd;'>Trend</th>"
+        f"{day_headers}"
+        "</tr>"
+        f"{daywise_trs}"
+        "</table>"
+
+        "<div style='color:#777;margin-top:10px;font-size:12px;'>"
+        "Notes: NR = Not Ranked. For accurate day-wise ranks, run Daily Fetch once per day."
+        "</div>"
+        "</body></html>"
+    )
     return html
 
 def build_weekly_csv(ws: date, we: date, prev_ws: date, prev_we: date, curr_days: list[date], curr_matrix: dict, prev_matrix: dict):
@@ -874,31 +905,31 @@ def build_weekly_csv(ws: date, we: date, prev_ws: date, prev_we: date, curr_days
             kw, loc, dev,
             (int(prev_best) if prev_best > 0 else "NR"),
             (int(curr_best) if curr_best > 0 else "NR"),
-            trend,
-            delta,
+            trend, delta,
         ]
         for d in curr_days:
             p = safe_float(curr_dm.get(d.isoformat(), {}).get("pos", 0.0)) if curr_dm else 0.0
             row.append(int(p) if p > 0 else "NR")
-
         writer.writerow(row)
 
     return output.getvalue().encode("utf-8")
 
-# ------------------- STREAMLIT UI -------------------
-st.set_page_config(page_title="SEO Rank + Weekly Report", page_icon="📈", layout="wide")
 
+# =========================================================
+# Streamlit UI
+# =========================================================
+st.set_page_config(page_title="SEO Rank + Weekly Report", page_icon="📈", layout="wide")
 st.title("📈 SEO Rank Tracker + Weekly SEO Report (GSC + GA4 + AI)")
 st.caption("Daily store → Compare → Weekly Mail with complete SEO report")
 
 if not SERPAPI_KEY:
-    st.error("SERPAPI_KEY missing (set it in Streamlit Secrets or .env).")
+    st.error("SERPAPI_KEY missing in Streamlit secrets / environment.")
     st.stop()
 
-# Sidebar Settings
+# Sidebar settings
 st.sidebar.header("⚙️ Project Settings")
 
-project_domain_input = st.sidebar.text_input("Brand URL (domain)", value="plumbersindubai.com")
+project_domain_input = st.sidebar.text_input("Brand URL / Domain", value="plumbersindubai.com")
 project_domain = normalize_domain(project_domain_input)
 
 project_name = st.sidebar.text_input("Project Name", value="SEO Project")
@@ -906,28 +937,32 @@ project_name = st.sidebar.text_input("Project Name", value="SEO Project")
 hl = st.sidebar.selectbox("Language (hl)", ["en", "hi", "ar", "fr", "es", "de"], index=0)
 device = st.sidebar.selectbox("Device", ["desktop", "mobile"], index=1)
 
-location_text = st.sidebar.text_input("Target Location (any worldwide)", value="Dubai, United Arab Emirates")
+location_text = st.sidebar.text_input("Target Location (worldwide)", value="Dubai, United Arab Emirates")
 auto_resolve = st.sidebar.checkbox("Auto-resolve location (recommended)", value=True)
 
 gl_manual = st.sidebar.text_input("Country code (gl) [auto]", value="").strip().lower()
 
+debug_serp = st.sidebar.checkbox("Debug SERP (show URLs if NR)", value=False)
+
 st.sidebar.markdown("---")
-st.sidebar.header("📩 Weekly Report Requirements (Mandatory)")
+st.sidebar.header("📩 Weekly Email Requirements (Mandatory)")
 
-missing_weekly = []
+missing_sidebar = []
 if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and REPORT_TO):
-    missing_weekly.append("SMTP settings")
+    missing_sidebar.append("SMTP (SMTP_HOST/SMTP_USER/SMTP_PASS/MAIL_FROM/REPORT_TO)")
 if not GOOGLE_OK:
-    missing_weekly.append("Google libraries")
-if not GOOGLE_CRED_FILE:
-    missing_weekly.append("Google service account JSON (GOOGLE_SERVICE_ACCOUNT_JSON)")
+    missing_sidebar.append("Google Python libraries")
+if not GOOGLE_SERVICE_ACCOUNT_JSON.strip():
+    missing_sidebar.append("GOOGLE_SERVICE_ACCOUNT_JSON (in Streamlit secrets)")
 if not GSC_SITE_URL:
-    missing_weekly.append("GSC_SITE_URL")
+    missing_sidebar.append("GSC_SITE_URL")
 if not GA4_PROPERTY_ID:
-    missing_weekly.append("GA4_PROPERTY_ID")
+    missing_sidebar.append("GA4_PROPERTY_ID")
 
-if missing_weekly:
-    st.sidebar.error("Weekly report missing:\n- " + "\n- ".join(missing_weekly))
+if missing_sidebar:
+    st.sidebar.error("Missing:\n- " + "\n- ".join(missing_sidebar))
+else:
+    st.sidebar.success("Weekly report configs OK ✅")
 
 st.sidebar.info(
     "GSC_SITE_URL must match property exactly:\n"
@@ -937,11 +972,7 @@ st.sidebar.info(
 
 # Keywords input
 st.subheader("📝 Keywords")
-keywords_text = st.text_area(
-    "Enter keywords (one per line)",
-    height=180,
-    placeholder="emergency plumber dubai\n24 hour plumber near me\nac repair dubai",
-)
+keywords_text = st.text_area("Enter keywords (one per line)", height=180, placeholder="emergency plumber dubai\n24 hour plumber near me\nac repair dubai")
 keywords = [k.strip() for k in keywords_text.splitlines() if k.strip()]
 
 colA, colB, colC = st.columns([1, 1, 2])
@@ -961,6 +992,7 @@ if auto_resolve and location_text.strip():
             resolved_gl = info.get("gl", "") or ""
 
 if not resolved_gl:
+    # fallback if SerpAPI can't determine
     resolved_gl = "us"
 
 st.info(f"Using location: **{resolved_location or '(none)'}** | gl: **{resolved_gl}** | hl: **{hl}** | device: **{device}**")
@@ -968,14 +1000,16 @@ st.info(f"Using location: **{resolved_location or '(none)'}** | gl: **{resolved_
 # DAILY RUN
 if run_daily_btn:
     if not project_domain or not keywords:
-        st.error("Please enter Brand URL (domain) and keywords.")
+        st.error("Please enter Brand domain and at least 1 keyword.")
     else:
         con = db_connect()
         try:
             progress = st.progress(0)
             rows_out = []
+
             for i, kw in enumerate(keywords):
                 st.write(f"🔍 Checking: **{kw}** ...")
+
                 try:
                     res = serpapi_get_rank(
                         serpapi_key=SERPAPI_KEY,
@@ -985,10 +1019,11 @@ if run_daily_btn:
                         hl=hl,
                         device=device,
                         location=resolved_location,
-                        top_n=100
+                        top_n=100,
+                        debug_collect=debug_serp
                     )
                 except Exception as e:
-                    res = {"position": 0.0, "url": "", "source": f"error:{type(e).__name__}"}
+                    res = {"position": 0.0, "url": "", "source": f"error:{type(e).__name__}", "debug": []}
 
                 upsert_daily_rank(
                     con,
@@ -999,8 +1034,8 @@ if run_daily_btn:
                     gl=resolved_gl,
                     hl=hl,
                     device=device,
-                    position=res["position"],
-                    url=res["url"],
+                    position=res.get("position", 0.0),
+                    url=res.get("url", ""),
                     source=res.get("source", ""),
                 )
                 con.commit()
@@ -1008,19 +1043,30 @@ if run_daily_btn:
                 rows_out.append({
                     "date": store_for_date.isoformat(),
                     "keyword": kw,
-                    "position": fmt_pos(res["position"]),
-                    "url": res["url"] or "",
+                    "position": fmt_pos(res.get("position", 0.0)),
+                    "url": res.get("url", "") or "",
                     "source": res.get("source", ""),
                     "gl": resolved_gl,
                     "hl": hl,
                     "device": device,
                     "location": resolved_location,
                 })
+
+                # If NR and debug enabled, show URLs
+                if debug_serp and fmt_pos(res.get("position", 0.0)) == "NR":
+                    with st.expander(f"Debug SERP URLs for: {kw}"):
+                        dbg = res.get("debug", [])
+                        if dbg:
+                            st.dataframe(pd.DataFrame(dbg), use_container_width=True)
+                        else:
+                            st.info("No debug URLs collected.")
+
                 progress.progress((i + 1) / len(keywords))
-                time.sleep(0.4)
+                time.sleep(0.6)
 
             st.success("✅ Stored daily ranks successfully!")
             st.dataframe(pd.DataFrame(rows_out), use_container_width=True)
+
         finally:
             con.close()
 
@@ -1051,7 +1097,6 @@ if compare_btn:
                 p1 = safe_float(r1.get("position", 0))
                 p2 = safe_float(r2.get("position", 0))
                 delta = int(p1 - p2) if (p1 > 0 and p2 > 0) else ""
-
                 out.append({
                     "keyword": k[0],
                     "location": k[1],
@@ -1066,18 +1111,20 @@ if compare_btn:
     finally:
         con.close()
 
+
 # WEEKLY EMAIL SEND
 st.subheader("📩 Weekly SEO Report")
 send_weekly_btn = st.button("📨 Send Weekly Email Now (Complete Report)")
 
 if send_weekly_btn:
+    # Hard requirements for your “mandatory details” rule
     missing = []
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and REPORT_TO):
         missing.append("SMTP settings")
     if not GOOGLE_OK:
         missing.append("Google libraries")
-    if not GOOGLE_CRED_FILE:
-        missing.append("GOOGLE_SERVICE_ACCOUNT_JSON (Streamlit Secrets)")
+    if not GOOGLE_SERVICE_ACCOUNT_JSON.strip():
+        missing.append("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not GSC_SITE_URL:
         missing.append("GSC_SITE_URL")
     if not GA4_PROPERTY_ID:
@@ -1102,59 +1149,69 @@ if send_weekly_btn:
         curr_matrix = build_matrix(curr_rows, curr_days)
         prev_matrix = build_matrix(prev_rows, prev_days)
 
+        # expected_keywords = what user typed; fallback to DB size
         expected_keywords = len(keywords) if keywords else max(len(curr_matrix), 0)
 
-        # ---- GSC + GA4 (mandatory) ----
-        gsc_curr = gsc_totals(GOOGLE_CRED_FILE, GSC_SITE_URL, ws.isoformat(), we.isoformat())
-        gsc_prev = gsc_totals(GOOGLE_CRED_FILE, GSC_SITE_URL, prev_ws.isoformat(), prev_we.isoformat())
-        gsc_top_queries = gsc_top(GOOGLE_CRED_FILE, GSC_SITE_URL, ws.isoformat(), we.isoformat(), dim="query", limit=10)
-        gsc_top_pages = gsc_top(GOOGLE_CRED_FILE, GSC_SITE_URL, ws.isoformat(), we.isoformat(), dim="page", limit=10)
+        # ---- Mandatory GSC + GA4 fetch ----
+        try:
+            gsc_curr = gsc_totals(GOOGLE_SERVICE_ACCOUNT_JSON, GSC_SITE_URL, ws.isoformat(), we.isoformat())
+            gsc_prev = gsc_totals(GOOGLE_SERVICE_ACCOUNT_JSON, GSC_SITE_URL, prev_ws.isoformat(), prev_we.isoformat())
+            gsc_top_queries = gsc_top(GOOGLE_SERVICE_ACCOUNT_JSON, GSC_SITE_URL, ws.isoformat(), we.isoformat(), dim="query", limit=10)
+            gsc_top_pages = gsc_top(GOOGLE_SERVICE_ACCOUNT_JSON, GSC_SITE_URL, ws.isoformat(), we.isoformat(), dim="page", limit=10)
+        except Exception as e:
+            st.error(f"GSC fetch failed (mandatory). Fix access/settings. Error: {e}")
+            st.stop()
 
-        ga_curr = ga4_totals(GOOGLE_CRED_FILE, GA4_PROPERTY_ID, ws.isoformat(), we.isoformat())
-        ga_prev = ga4_totals(GOOGLE_CRED_FILE, GA4_PROPERTY_ID, prev_ws.isoformat(), prev_we.isoformat())
-        ga_curr_org = ga4_organic_sessions(GOOGLE_CRED_FILE, GA4_PROPERTY_ID, ws.isoformat(), we.isoformat())
-        ga_prev_org = ga4_organic_sessions(GOOGLE_CRED_FILE, GA4_PROPERTY_ID, prev_ws.isoformat(), prev_we.isoformat())
+        try:
+            ga_curr = ga4_totals(GOOGLE_SERVICE_ACCOUNT_JSON, GA4_PROPERTY_ID, ws.isoformat(), we.isoformat())
+            ga_prev = ga4_totals(GOOGLE_SERVICE_ACCOUNT_JSON, GA4_PROPERTY_ID, prev_ws.isoformat(), prev_we.isoformat())
+            ga_curr_org = ga4_organic_sessions(GOOGLE_SERVICE_ACCOUNT_JSON, GA4_PROPERTY_ID, ws.isoformat(), we.isoformat())
+            ga_prev_org = ga4_organic_sessions(GOOGLE_SERVICE_ACCOUNT_JSON, GA4_PROPERTY_ID, prev_ws.isoformat(), prev_we.isoformat())
+        except Exception as e:
+            st.error(f"GA4 fetch failed (mandatory). Fix property ID / permissions. Error: {e}")
+            st.stop()
 
-        # ---- LLM insights (strict) ----
+        # ---- LLM insights (optional strict) ----
         curr_sum = summarize_week(curr_matrix, expected_keywords)
         prev_sum = summarize_week(prev_matrix, expected_keywords)
         ups, downs = movers_vs_prev(curr_matrix, prev_matrix, limit=10)
 
-        payload = f"""
-PROJECT: {project_name} ({project_domain})
-CURRENT WEEK: {ws.isoformat()} to {we.isoformat()}
-PREVIOUS WEEK: {prev_ws.isoformat()} to {prev_we.isoformat()}
-
-RANK KPIs:
-Tracked: {curr_sum['keywords_tracked']}
-Ranked: {curr_sum['ranked_keywords']}
-Top3: {curr_sum['top3']}
-Top10: {curr_sum['top10']}
-Top20: {curr_sum['top20']}
-Avg Best Position: {curr_sum['avg_best_position']:.2f}
-
-GSC KPIs (WoW):
-Clicks: {gsc_prev['clicks']} -> {gsc_curr['clicks']}
-Impressions: {gsc_prev['impressions']} -> {gsc_curr['impressions']}
-CTR: {gsc_prev['ctr']*100:.2f}% -> {gsc_curr['ctr']*100:.2f}%
-Avg Position: {gsc_prev['position']:.2f} -> {gsc_curr['position']:.2f}
-
-GA4 KPIs (WoW):
-Users: {ga_prev['users']} -> {ga_curr['users']}
-Sessions: {ga_prev['sessions']} -> {ga_curr['sessions']}
-Organic Sessions: {ga_prev_org} -> {ga_curr_org}
-Engagement Rate: {ga_prev['engagement_rate']*100:.2f}% -> {ga_curr['engagement_rate']*100:.2f}%
-Conversions: {ga_prev['conversions']} -> {ga_curr['conversions']}
-
-TOP IMPROVED:
-{chr(10).join([f"- {m['keyword']}: {fmt_pos(m['prev_best'])} -> {fmt_pos(m['curr_best'])}" for m in ups[:5]])}
-
-TOP DROPPED:
-{chr(10).join([f"- {m['keyword']}: {fmt_pos(m['prev_best'])} -> {fmt_pos(m['curr_best'])}" for m in downs[:5]])}
-""".strip()
+        payload = "\n".join([
+            f"PROJECT: {project_name} ({project_domain})",
+            f"CURRENT WEEK: {ws.isoformat()} to {we.isoformat()}",
+            f"PREVIOUS WEEK: {prev_ws.isoformat()} to {prev_we.isoformat()}",
+            "",
+            "RANK KPIs:",
+            f"Tracked: {curr_sum['keywords_tracked']}",
+            f"Ranked: {curr_sum['ranked_keywords']}",
+            f"Top3: {curr_sum['top3']}",
+            f"Top10: {curr_sum['top10']}",
+            f"Top20: {curr_sum['top20']}",
+            f"Avg Best Position: {curr_sum['avg_best_position']:.2f}",
+            "",
+            "GSC KPIs (WoW):",
+            f"Clicks: {gsc_prev['clicks']} -> {gsc_curr['clicks']}",
+            f"Impressions: {gsc_prev['impressions']} -> {gsc_curr['impressions']}",
+            f"CTR: {gsc_prev['ctr']*100:.2f}% -> {gsc_curr['ctr']*100:.2f}%",
+            f"Avg Position: {gsc_prev['position']:.2f} -> {gsc_curr['position']:.2f}",
+            "",
+            "GA4 KPIs (WoW):",
+            f"Users: {ga_prev['users']} -> {ga_curr['users']}",
+            f"Sessions: {ga_prev['sessions']} -> {ga_curr['sessions']}",
+            f"Organic Sessions: {ga_prev_org} -> {ga_curr_org}",
+            f"Engagement Rate: {ga_prev['engagement_rate']*100:.2f}% -> {ga_curr['engagement_rate']*100:.2f}%",
+            f"Conversions: {ga_prev['conversions']} -> {ga_curr['conversions']}",
+            "",
+            "TOP IMPROVED:",
+            *[f"- {m['keyword']}: {fmt_pos(m['prev_best'])} -> {fmt_pos(m['curr_best'])}" for m in ups[:5]],
+            "",
+            "TOP DROPPED:",
+            *[f"- {m['keyword']}: {fmt_pos(m['prev_best'])} -> {fmt_pos(m['curr_best'])}" for m in downs[:5]],
+        ])
 
         llm_html = generate_llm_insights_strict(payload)
 
+        # Build full email HTML + CSV
         html = build_weekly_email_html(
             project_name=project_name,
             domain=project_domain,
@@ -1183,6 +1240,7 @@ TOP DROPPED:
 
         st.success("✅ Weekly report email sent successfully!")
         st.download_button("⬇️ Download Weekly CSV", csv_bytes, file_name=csv_name, mime="text/csv")
+
         with st.expander("Preview Weekly Email HTML"):
             st.components.v1.html(html, height=800, scrolling=True)
 
