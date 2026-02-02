@@ -8,6 +8,8 @@ import sqlite3
 import requests
 from datetime import datetime, date, timedelta
 from urllib.parse import urlparse
+import tempfile
+import json
 
 import pandas as pd
 import streamlit as st
@@ -15,20 +17,69 @@ from dotenv import load_dotenv
 from email.message import EmailMessage
 import smtplib
 
-# ------------------- ENV -------------------
-load_dotenv()
+# ------------------- ENV (local + Streamlit Cloud secrets) -------------------
+load_dotenv()  # local dev only; Streamlit Cloud uses st.secrets
 
-SERPAPI_KEY = os.getenv("SERPAPI_KEY", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+def env_get(key: str, default: str = "") -> str:
+    """
+    Read from Streamlit Secrets first (Cloud), then environment variables (.env/local).
+    Always returns string.
+    """
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            v = st.secrets[key]
+            return str(v).strip()
+    except Exception:
+        pass
+    return str(os.getenv(key, default)).strip()
+
+def ensure_google_application_credentials() -> str:
+    """
+    Streamlit Cloud has no local credential file. This function:
+    - checks if GOOGLE_APPLICATION_CREDENTIALS points to an existing file
+    - else reads GOOGLE_SERVICE_ACCOUNT_JSON (or GOOGLE_CREDENTIALS_JSON) from secrets/env
+    - writes a temp json file and sets GOOGLE_APPLICATION_CREDENTIALS
+    """
+    existing = env_get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if existing and os.path.exists(existing):
+        return existing
+
+    sa_json = env_get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    if not sa_json:
+        sa_json = env_get("GOOGLE_CREDENTIALS_JSON", "")
+
+    if not sa_json:
+        return ""
+
+    # If user stored it like {"private_key":"-----BEGIN...\\n..."} this is still valid JSON,
+    # but we should ensure it's JSON and write it cleanly.
+    try:
+        info = json.loads(sa_json)
+        # Re-dump to normalize escaping and ensure valid JSON
+        sa_json_clean = json.dumps(info)
+    except Exception:
+        # It's maybe already a raw JSON string; write as-is
+        sa_json_clean = sa_json
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+    tmp.write(sa_json_clean.encode("utf-8"))
+    tmp.close()
+
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
+    return tmp.name
+
+
+SERPAPI_KEY = env_get("SERPAPI_KEY")
+OPENAI_API_KEY = env_get("OPENAI_API_KEY")
 
 # SMTP
-SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587").strip() or "587")
-SMTP_USER = os.getenv("SMTP_USER", "").strip()
-SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
-MAIL_FROM = os.getenv("MAIL_FROM", "").strip()
-REPORT_TO = [x.strip() for x in os.getenv("REPORT_TO", "").split(",") if x.strip()]
-REPORT_CC = [x.strip() for x in os.getenv("REPORT_CC", "").split(",") if x.strip()]
+SMTP_HOST = env_get("SMTP_HOST")
+SMTP_PORT = int(env_get("SMTP_PORT", "587") or "587")
+SMTP_USER = env_get("SMTP_USER")
+SMTP_PASS = env_get("SMTP_PASS")
+MAIL_FROM = env_get("MAIL_FROM")
+REPORT_TO = [x.strip() for x in env_get("REPORT_TO").split(",") if x.strip()]
+REPORT_CC = [x.strip() for x in env_get("REPORT_CC").split(",") if x.strip()]
 
 # Google
 GOOGLE_OK = True
@@ -40,12 +91,14 @@ try:
 except Exception:
     GOOGLE_OK = False
 
-GOOGLE_CRED_FILE = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-GSC_SITE_URL = os.getenv("GSC_SITE_URL", "").strip()
-GA4_PROPERTY_ID = os.getenv("GA4_PROPERTY_ID", "").strip()
+# IMPORTANT: create temp file on Streamlit Cloud if secrets provided
+GOOGLE_CRED_FILE = ensure_google_application_credentials()
+
+GSC_SITE_URL = env_get("GSC_SITE_URL")
+GA4_PROPERTY_ID = env_get("GA4_PROPERTY_ID")
 
 # ------------------- DB --------------------
-DB = os.getenv("SQLITE_DB", "rank_history.db").strip() or "rank_history.db"
+DB = env_get("SQLITE_DB", "rank_history.db") or "rank_history.db"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS daily_ranks (
@@ -244,14 +297,12 @@ def serpapi_get_rank(
     if location:
         params["location"] = location
 
-    # paginate 0..90
     for start in range(0, min(top_n, 100), 10):
         params["start"] = start
         r = requests.get("https://serpapi.com/search.json", params=params, timeout=60)
         r.raise_for_status()
         data = r.json()
 
-        # Organic only (stable)
         organic = data.get("organic_results", []) or []
         for item in organic:
             pos = item.get("position")
@@ -355,15 +406,16 @@ def ga4_organic_sessions(sa_file: str, property_id: str, start_date: str, end_da
 
 # ------------------- MATRIX / WEEK CALCS -------------------
 def build_matrix(rows: list[dict], days: list[date]) -> dict:
-    """
-    key=(keyword, location, device) -> map day->pos/url/source
-    """
     m = {}
     for r in rows:
         k = (r["keyword"], r.get("location", ""), r.get("device", "desktop"))
         if k not in m:
             m[k] = {}
-        m[k][r["checked_date"]] = {"pos": safe_float(r.get("position")), "url": r.get("url","") or "", "source": r.get("source","") or ""}
+        m[k][r["checked_date"]] = {
+            "pos": safe_float(r.get("position")),
+            "url": r.get("url","") or "",
+            "source": r.get("source","") or ""
+        }
 
     for k in list(m.keys()):
         for d in days:
@@ -402,9 +454,9 @@ def movers_vs_prev(curr_matrix: dict, prev_matrix: dict, limit=20):
         if cb > 0 and pb > 0:
             delta = cb - pb
         elif cb > 0 and pb == 0:
-            delta = -9999  # NEW
+            delta = -9999
         elif cb == 0 and pb > 0:
-            delta = 9999   # LOST
+            delta = 9999
         else:
             delta = 0.0
 
@@ -420,7 +472,7 @@ def movers_vs_prev(curr_matrix: dict, prev_matrix: dict, limit=20):
 # ------------------- EMAIL -------------------
 def send_email(subject: str, html_body: str, csv_bytes: bytes, csv_filename: str):
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and REPORT_TO):
-        raise RuntimeError("SMTP settings missing in .env")
+        raise RuntimeError("SMTP settings missing (set via Streamlit Secrets or .env)")
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -449,10 +501,6 @@ def clean_llm_html(s: str) -> str:
     return s.strip()
 
 def generate_llm_insights_strict(payload_text: str) -> str:
-    """
-    Generates insights ONLY from provided numbers.
-    If OpenAI key missing, returns empty string.
-    """
     if not OPENAI_API_KEY:
         return ""
 
@@ -594,7 +642,6 @@ def build_weekly_email_html(
         </table>
         """
 
-    # Day-wise rank table
     day_headers = "".join([
         f"<th style='border:1px solid #ddd;background:#f4f4f4;'>{d.strftime('%a')}<br>{d.strftime('%d-%b')}</th>"
         for d in curr_days
@@ -697,8 +744,8 @@ def build_weekly_email_html(
         {kpi_row("Conversions", ga_prev.get("conversions",0.0), ga_curr.get("conversions",0.0))}
       </table>
 
-      {movers_table("Keywords Improved (Top movers)", ups)}
-      {movers_table("Keywords Dropped (Top movers)", downs)}
+      {movers_table("Keywords Improved (Top movers)", movers_vs_prev(curr_matrix, prev_matrix, limit=15)[0])}
+      {movers_table("Keywords Dropped (Top movers)", movers_vs_prev(curr_matrix, prev_matrix, limit=15)[1])}
 
       <h3 style="margin:18px 0 8px;">Day-wise Ranks (Current Week)</h3>
       <table cellpadding="7" cellspacing="0" border="0" style="border-collapse:collapse;width:100%;max-width:980px;">
@@ -780,7 +827,7 @@ st.title("📈 SEO Rank Tracker + Weekly SEO Report (GSC + GA4 + AI)")
 st.caption("Daily store → Compare → Weekly Mail with complete SEO report (no optional sections)")
 
 if not SERPAPI_KEY:
-    st.error("SERPAPI_KEY missing in .env")
+    st.error("SERPAPI_KEY missing (set in Streamlit Secrets or .env)")
     st.stop()
 
 # Sidebar Settings
@@ -803,15 +850,15 @@ st.sidebar.markdown("---")
 st.sidebar.header("📩 Weekly Mail Requirements (Mandatory)")
 
 if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and REPORT_TO):
-    st.sidebar.error("SMTP not configured in .env. Weekly mail needs SMTP details.")
+    st.sidebar.error("SMTP not configured. Weekly mail needs SMTP details.")
 if not GOOGLE_OK:
     st.sidebar.error("Google libs missing. Install google-api-python-client google-auth google-analytics-data")
 if not (GOOGLE_CRED_FILE and os.path.exists(GOOGLE_CRED_FILE)):
-    st.sidebar.error("GOOGLE_APPLICATION_CREDENTIALS missing or file not found.")
+    st.sidebar.error("Google credentials missing. Add GOOGLE_SERVICE_ACCOUNT_JSON in Streamlit Secrets.")
 if not GSC_SITE_URL:
-    st.sidebar.error("GSC_SITE_URL missing in .env")
+    st.sidebar.error("GSC_SITE_URL missing")
 if not GA4_PROPERTY_ID:
-    st.sidebar.error("GA4_PROPERTY_ID missing in .env")
+    st.sidebar.error("GA4_PROPERTY_ID missing")
 
 st.sidebar.info(
     "GSC_SITE_URL must match property exactly:\n"
@@ -843,7 +890,7 @@ if auto_resolve and location_text.strip():
         resolved_location = location_text.strip()
 
 if not resolved_gl:
-    resolved_gl = "us"  # safe default
+    resolved_gl = "us"
 
 st.info(f"Using location: **{resolved_location or '(none)'}** | gl: **{resolved_gl}** | hl: **{hl}** | device: **{device}**")
 
@@ -932,10 +979,7 @@ if compare_btn:
                 r2 = m2.get(k, {})
                 p1 = safe_float(r1.get("position", 0))
                 p2 = safe_float(r2.get("position", 0))
-                if p1 > 0 and p2 > 0:
-                    delta = int(p1 - p2)
-                else:
-                    delta = ""
+                delta = int(p1 - p2) if (p1 > 0 and p2 > 0) else ""
 
                 out.append({
                     "keyword": k[0],
@@ -956,14 +1000,13 @@ st.subheader("📩 Weekly SEO Report")
 send_weekly_btn = st.button("📨 Send Weekly Email Now (Complete Report)")
 
 if send_weekly_btn:
-    # Validate required configs
     missing = []
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and REPORT_TO):
         missing.append("SMTP settings (SMTP_HOST/SMTP_USER/SMTP_PASS/MAIL_FROM/REPORT_TO)")
     if not GOOGLE_OK:
         missing.append("Google libraries")
     if not (GOOGLE_CRED_FILE and os.path.exists(GOOGLE_CRED_FILE)):
-        missing.append("GOOGLE_APPLICATION_CREDENTIALS file")
+        missing.append("Google credentials (set GOOGLE_SERVICE_ACCOUNT_JSON in Streamlit Secrets)")
     if not GSC_SITE_URL:
         missing.append("GSC_SITE_URL")
     if not GA4_PROPERTY_ID:
@@ -990,7 +1033,6 @@ if send_weekly_btn:
 
         expected_keywords = len(keywords) if keywords else max(len(curr_matrix), 0)
 
-        # ---- GSC + GA4 (mandatory) ----
         gsc_curr = gsc_totals(GOOGLE_CRED_FILE, GSC_SITE_URL, ws.isoformat(), we.isoformat())
         gsc_prev = gsc_totals(GOOGLE_CRED_FILE, GSC_SITE_URL, prev_ws.isoformat(), prev_we.isoformat())
         gsc_top_queries = gsc_top(GOOGLE_CRED_FILE, GSC_SITE_URL, ws.isoformat(), we.isoformat(), dim="query", limit=10)
@@ -1001,8 +1043,6 @@ if send_weekly_btn:
         ga_curr_org = ga4_organic_sessions(GOOGLE_CRED_FILE, GA4_PROPERTY_ID, ws.isoformat(), we.isoformat())
         ga_prev_org = ga4_organic_sessions(GOOGLE_CRED_FILE, GA4_PROPERTY_ID, prev_ws.isoformat(), prev_we.isoformat())
 
-        # ---- LLM insights (strict) ----
-        # build a safe payload text from actual numbers only
         curr_sum = summarize_week(curr_matrix, expected_keywords)
         prev_sum = summarize_week(prev_matrix, expected_keywords)
         ups, downs = movers_vs_prev(curr_matrix, prev_matrix, limit=10)
@@ -1042,7 +1082,6 @@ TOP DROPPED:
 
         llm_html = generate_llm_insights_strict(payload)
 
-        # Build full email HTML + CSV
         html = build_weekly_email_html(
             project_name=project_name,
             domain=project_domain,
