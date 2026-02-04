@@ -178,7 +178,6 @@ def list_available_dates(con, project_domain):
         """,
         (project_domain,),
     ).fetchall()
-    # return oldest -> newest
     return [(r["checked_date"], int(r["cnt"])) for r in rows]
 
 # =========================================================
@@ -408,7 +407,7 @@ def ga4_organic_sessions(sa_file: str, property_id: str, start_date: str, end_da
     return organic
 
 # =========================================================
-# Email + LLM (same as your base)
+# Email + LLM
 # =========================================================
 def send_email(subject: str, html_body: str, csv_bytes: bytes, csv_filename: str):
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and REPORT_TO):
@@ -482,7 +481,7 @@ Return ONLY HTML.
         return ""
 
 # =========================================================
-# Weekly matrix helpers (same as your base)
+# Weekly matrix helpers
 # =========================================================
 def build_matrix(rows: list[dict], days: list[date]) -> dict:
     m = {}
@@ -548,7 +547,7 @@ def movers_vs_prev(curr_matrix: dict, prev_matrix: dict, limit=20):
     return ups, downs
 
 # =========================================================
-# Weekly email HTML/CSV (your base)
+# Weekly email HTML/CSV (kept from your base)
 # =========================================================
 def build_weekly_email_html(
     project_name: str,
@@ -648,7 +647,6 @@ def build_weekly_email_html(
         </table>
         """
 
-    # Day-wise rank table
     day_headers = "".join([
         f"<th style='border:1px solid #ddd;background:#f4f4f4;'>{d.strftime('%a')}<br>{d.strftime('%d-%b')}</th>"
         for d in curr_days
@@ -799,7 +797,7 @@ def build_weekly_csv(ws: date, we: date, prev_ws: date, prev_we: date, curr_days
         if curr_best > 0 and prev_best > 0:
             delta_val = int(curr_best - prev_best)
             trend = "UP" if delta_val < 0 else ("DOWN" if delta_val > 0 else "SAME")
-            delta = str(delta_val)   # STRING (fix Arrow issues everywhere)
+            delta = str(delta_val)   # STRING (fix Arrow issues)
         elif curr_best > 0 and prev_best == 0:
             delta = "NEW"
             trend = "UP"
@@ -839,7 +837,6 @@ if not SERPAPI_KEY:
     st.error("SERPAPI_KEY missing (set in Streamlit Secrets or .env)")
     st.stop()
 
-# Sidebar Settings
 st.sidebar.header("⚙️ Project Settings")
 project_domain_input = st.sidebar.text_input("Brand URL (domain)", value="plumbersindubai.com")
 project_domain = normalize_domain(project_domain_input)
@@ -866,16 +863,13 @@ if not resolved_gl:
 
 st.info(f"Using location: **{resolved_location or '(none)'}** | gl: **{resolved_gl}** | hl: **{hl}** | device: **{device}**")
 
-# Keywords input
 st.subheader("📝 Keywords")
 keywords_text = st.text_area("Enter keywords (one per line)", height=160)
 keywords = [k.strip() for k in keywords_text.splitlines() if k.strip()]
 
 tabs = st.tabs(["✅ Daily Fetch", "📊 Compare Two Dates", "📅 History", "📩 Weekly Email"])
 
-# ---------------------------------------------------------
-# TAB: Daily Fetch
-# ---------------------------------------------------------
+# Daily Fetch
 with tabs[0]:
     colA, colB = st.columns([1, 1])
     store_for_date = colA.date_input("Store for date", value=today_local())
@@ -939,9 +933,7 @@ with tabs[0]:
             finally:
                 con.close()
 
-# ---------------------------------------------------------
-# TAB: Compare Two Dates  ✅ FIXED
-# ---------------------------------------------------------
+# Compare Two Dates ✅ supports ANY saved date
 with tabs[1]:
     con = db_connect()
     try:
@@ -950,11 +942,9 @@ with tabs[1]:
         if not saved:
             st.warning("No saved data for this domain yet. Run Daily Fetch first.")
         else:
-            # Build dropdown choices from DB (this is the real fix)
             date_list = [d for d, cnt in saved]
             label_map = {d: f"{d}  —  {cnt} rows" for d, cnt in saved}
 
-            # sensible defaults: latest and previous (if exists)
             default_idx_1 = len(date_list) - 1
             default_idx_2 = len(date_list) - 2 if len(date_list) >= 2 else len(date_list) - 1
 
@@ -973,7 +963,6 @@ with tabs[1]:
             )
             show_only_changed = c3.checkbox("Show only changed keywords", value=False)
 
-            # Always render comparison (no button needed; avoids rerun confusion)
             d1 = date.fromisoformat(d1_str)
             d2 = date.fromisoformat(d2_str)
 
@@ -995,9 +984,6 @@ with tabs[1]:
                 p1 = safe_float(r1.get("position", 0))
                 p2 = safe_float(r2.get("position", 0))
 
-                # delta logic:
-                # In ranks, LOWER number is better.
-                # We'll compute change as p2 - p1 if both present.
                 change = None
                 trend = "SAME"
                 arrow = "●"
@@ -1005,23 +991,17 @@ with tabs[1]:
                 if p1 > 0 and p2 > 0:
                     change = int(p2 - p1)
                     if change < 0:
-                        trend, arrow = "UP", "▲"      # improved (rank number dropped)
+                        trend, arrow = "UP", "▲"
                     elif change > 0:
                         trend, arrow = "DOWN", "▼"
                     else:
                         trend, arrow = "SAME", "●"
                 elif p1 == 0 and p2 > 0:
                     trend, arrow = "NEW", "▲"
-                    change = None
                 elif p1 > 0 and p2 == 0:
                     trend, arrow = "LOST", "▼"
-                    change = None
 
-                # delta as string ALWAYS (fix Arrow error)
-                if change is None:
-                    delta_str = ""
-                else:
-                    delta_str = f"{change:+d}"
+                delta_str = "" if change is None else f"{change:+d}"
 
                 row = {
                     "keyword": k[0],
@@ -1034,23 +1014,19 @@ with tabs[1]:
                     "delta": delta_str,
                 }
 
-                if show_only_changed:
-                    if trend == "SAME":
-                        continue
+                if show_only_changed and trend == "SAME":
+                    continue
 
                 out.append(row)
 
             st.subheader("📊 Two Date Rank Comparison")
-            st.caption("Trend meaning: UP = rank improved (position number decreased), DOWN = dropped (position number increased)")
-            df = pd.DataFrame(out)
-            st.dataframe(df, width="stretch")
+            st.caption("UP = improved (rank number decreased), DOWN = dropped (rank number increased)")
+            st.dataframe(pd.DataFrame(out), width="stretch")
 
     finally:
         con.close()
 
-# ---------------------------------------------------------
-# TAB: History / Debug
-# ---------------------------------------------------------
+# History
 with tabs[2]:
     con = db_connect()
     try:
@@ -1064,9 +1040,7 @@ with tabs[2]:
     finally:
         con.close()
 
-# ---------------------------------------------------------
-# TAB: Weekly Email (kept same; will work once permissions OK)
-# ---------------------------------------------------------
+# Weekly Email
 with tabs[3]:
     st.write("### 📩 Weekly SEO Email")
     send_weekly_btn = st.button("📨 Send Weekly Email Now", type="primary")
@@ -1105,7 +1079,6 @@ with tabs[3]:
 
             expected_keywords = len(keywords) if keywords else max(len(curr_matrix), 0)
 
-            # Google mandatory
             gsc_curr = gsc_totals(GOOGLE_CRED_FILE, GSC_SITE_URL, ws.isoformat(), we.isoformat())
             gsc_prev = gsc_totals(GOOGLE_CRED_FILE, GSC_SITE_URL, prev_ws.isoformat(), prev_we.isoformat())
             gsc_top_queries = gsc_top(GOOGLE_CRED_FILE, GSC_SITE_URL, ws.isoformat(), we.isoformat(), dim="query", limit=10)
