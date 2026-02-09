@@ -10,7 +10,6 @@ import tempfile
 import json
 from datetime import datetime, date, timedelta, timezone
 from urllib.parse import urlparse
-
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -1163,3 +1162,6 @@ TOP DROPPED:
             st.error(f"❌ Weekly mail failed: {e}")
         finally:
             con.close()
+
+
+
